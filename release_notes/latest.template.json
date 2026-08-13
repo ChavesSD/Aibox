@@ -1,0 +1,29 @@
+{
+  "version": "1.0.0",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-13",
+  "notes": {
+    "added": [
+      "Instalador único sem APKs embutidos",
+      "Download de APKs a partir do repositório de releases"
+    ],
+    "fixed": [
+      "Detecção USB de totens Allwinner (adb_usb.ini)"
+    ],
+    "removed": []
+  },
+  "asset": {
+    "name": "Aibox-windows-x64-1.0.0.zip",
+    "url": "https://github.com/ChavesSD/ReleasesAibox/releases/download/v1.0.0/Aibox-windows-x64-1.0.0.zip",
+    "sha256": "",
+    "size": 0
+  },
+  "installer": {
+    "name": "Aibox-Setup.exe",
+    "url": "https://github.com/ChavesSD/ReleasesAibox/releases/download/v1.0.0/Aibox-Setup.exe",
+    "install_dir": "C:\\Aibox",
+    "includes_apks": false
+  },
+  "apks_manifest": "https://raw.githubusercontent.com/ChavesSD/ReleasesAibox/main/apks.json"
+}

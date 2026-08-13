@@ -1,0 +1,27 @@
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec.bak
+
+# Ambientes
+.venv/
+venv/
+.env
+
+# APKs (não entram no repositório de código)
+Apks/
+*.apk
+
+# Binários ADB (baixados no build)
+aibox/platform-tools/*.exe
+aibox/platform-tools/*.dll
+aibox/Aibox.ico
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

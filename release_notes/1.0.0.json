@@ -1,0 +1,16 @@
+{
+  "version": "1.0.0",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-07-30",
+  "notes": {
+    "added": [
+      "Interface Aibox com sidebar e animações de ícones",
+      "Instalação de APKs por catálogo",
+      "Barra de progresso na instalação",
+      "Sistema interno de atualização (Sobre)"
+    ],
+    "fixed": [],
+    "removed": []
+  }
+}
