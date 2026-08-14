@@ -7,7 +7,7 @@ import socket
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QEasingCurve, QEvent, QPropertyAnimation, QSize, QTimer, QUrl, Slot
+from PySide6.QtCore import Qt, QEasingCurve, QEvent, QPropertyAnimation, QSize, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .adb import Adb, AdbDevice, AdbError, InstalledApp
+from .adb import Adb, AdbDevice, AdbError, AutostartConfigResult, InstalledApp, TtsConfigResult
 from .apks_catalog import (
     APK_CATALOG,
     APK_CATEGORIES,
@@ -236,12 +236,75 @@ class PreviewFrame(QLabel):
         self._apply_scaled()
 
 
+def install_apk_phase_percent(
+    done: int,
+    total: int,
+    *,
+    has_post_install: bool,
+) -> int:
+    """Progresso só da instalação dos APKs. Com pós-config, teto 60%."""
+    if total <= 0:
+        return 0
+    span = 60 if has_post_install else 100
+    return min(span, int(round(span * done / total)))
+
+
+def is_autostart_apk(entry: ApkEntry) -> bool:
+    return entry.filename == "Autostart.apk" or entry.label.lower() == "autostart"
+
+
+def wants_boot_autostart(entry: ApkEntry) -> bool:
+    """Apps que entram no autoinício. Autostart e TTS não abrem sozinhos no boot."""
+    if is_autostart_apk(entry):
+        return False
+    if entry.post_install == "tts_pt_br_voice_v":
+        return False
+    return True
+
+
+def expand_install_dependencies(
+    entries: list[ApkEntry],
+    *,
+    tts: ApkEntry | None,
+    autostart: ApkEntry | None,
+) -> list[ApkEntry]:
+    """Painel puxa TTS; qualquer APK (exceto o próprio Autostart) puxa Autostart.apk."""
+    if not entries:
+        return entries
+
+    has_painel = any(e.category == "Painel" for e in entries)
+    has_non_autostart = any(not is_autostart_apk(e) for e in entries)
+    tts_dep = tts if has_painel else None
+    autostart_dep = autostart if has_non_autostart else None
+
+    seen: set[tuple[str, str]] = set()
+    out: list[ApkEntry] = []
+
+    def add(e: ApkEntry | None) -> None:
+        if e is None:
+            return
+        key = (e.category, e.filename)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(e)
+
+    add(tts_dep)
+    add(autostart_dep)
+    for e in entries:
+        add(e)
+    return out
+
+
 class MainWindow(QMainWindow):
+    _install_phase_progress = Signal(int, str)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.resize(920, 820)
         self.setMinimumSize(900, 800)
+        self._install_phase_progress.connect(self._on_install_phase_progress)
 
         self.bg = Background()
         self.adb: Adb | None = None
@@ -287,6 +350,7 @@ class MainWindow(QMainWindow):
         self._install_configure_boot: bool = False
         self._install_need_tts_config: bool = False
         self._install_tts_apk_ok: bool = False
+        self._install_post_pending: bool = False
         self._uninstall_rows: list[tuple[InstalledApp, ToggleRow]] = []
         self._uninstall_busy: bool = False
         self._uninstall_queue: list[InstalledApp] = []
@@ -912,7 +976,7 @@ class MainWindow(QMainWindow):
         )
         card_lay.addWidget(
             self._info_panel(
-                "• Totem e Painel: autoinício via firmware + Autostart.apk\n"
+                "• Qualquer APK marca Autostart automaticamente (autoinício)\n"
                 "• Painel marca/desmarca Síntese de Voz automaticamente\n"
                 "• Síntese de Voz: instala o APK e configura pt-BR / Voz V\n"
                 "• APKs são baixados do repositório de releases (não vêm no instalador)"
@@ -1370,6 +1434,8 @@ class MainWindow(QMainWindow):
                 self._set_catalog_apk_checked(self._sintese_de_voz_entry(), True)
             else:
                 self._set_catalog_apk_checked(self._sintese_de_voz_entry(), False)
+        if not self._is_autostart_apk(entry):
+            self._sync_autostart_checkbox()
 
     def _any_apk_checked_in(self, category: str) -> bool:
         rows = self._apk_rows.get(category) or []
@@ -1387,16 +1453,59 @@ class MainWindow(QMainWindow):
                 return e
         return None
 
-    def _set_catalog_apk_checked(self, entry: ApkEntry | None, checked: bool) -> None:
+    def _is_autostart_apk(self, entry: ApkEntry) -> bool:
+        return is_autostart_apk(entry)
+
+    def _wants_boot_autostart(self, entry: ApkEntry) -> bool:
+        return wants_boot_autostart(entry)
+
+    def _any_non_autostart_apk_checked(self) -> bool:
+        for rows in self._apk_rows.values():
+            for entry, row in rows:
+                if self._is_autostart_apk(entry):
+                    continue
+                if row.isChecked() and row.toggle.isEnabled():
+                    return True
+        return False
+
+    def _sync_autostart_checkbox(self) -> None:
+        """Marca Autostart na lista sempre que qualquer outro APK estiver ativo."""
+        if not getattr(self, "_apk_rows", None):
+            return
+        want = self._any_non_autostart_apk_checked()
+        self._set_catalog_apk_checked(self._autostart_entry(), want, force=True)
+        if want:
+            self._expand_apk_category("Outros")
+
+    def _expand_apk_category(self, category: str) -> None:
+        btn = self._apk_accordion_btns.get(category)
+        if btn is not None and not btn.isChecked():
+            btn.setChecked(True)
+        self._toggle_apk_category(category, True)
+
+    def _set_catalog_apk_checked(
+        self,
+        entry: ApkEntry | None,
+        checked: bool,
+        *,
+        force: bool = False,
+    ) -> None:
         if entry is None:
             return
         rows = self._apk_rows.get(entry.category) or []
         for e, row in rows:
             if e.filename != entry.filename:
                 continue
-            if not row.toggle.isEnabled():
+            if force and checked:
+                path = resolve_apk(entry)
+                if path.exists() and path.stat().st_size > 0:
+                    row.setEnabled(True)
+                    row.toggle.setEnabled(True)
+                    row.setText(entry.label)
+            if not row.toggle.isEnabled() and not force:
                 break
             if row.isChecked() == checked:
+                self._update_apk_accordion_label(entry.category)
                 break
             row.toggle.blockSignals(True)
             row.setChecked(checked)
@@ -1405,36 +1514,11 @@ class MainWindow(QMainWindow):
             break
 
     def _expand_install_dependencies(self, entries: list[ApkEntry]) -> list[ApkEntry]:
-        """Dependências automáticas da fila de instalação.
-
-        - Painel → Síntese de Voz (primeiro)
-        - Totem/Painel → Autostart.apk (autoinício confiável neste firmware)
-        """
-        if not entries:
-            return entries
-
-        has_painel = any(e.category == "Painel" for e in entries)
-        has_boot_app = any(e.category in ("Totem", "Painel") for e in entries)
-        tts = self._sintese_de_voz_entry() if has_painel else None
-        autostart = self._autostart_entry() if has_boot_app else None
-
-        seen: set[tuple[str, str]] = set()
-        out: list[ApkEntry] = []
-
-        def add(e: ApkEntry | None) -> None:
-            if e is None:
-                return
-            key = (e.category, e.filename)
-            if key in seen:
-                return
-            seen.add(key)
-            out.append(e)
-
-        add(tts)
-        add(autostart)
-        for e in entries:
-            add(e)
-        return out
+        return expand_install_dependencies(
+            entries,
+            tts=self._sintese_de_voz_entry(),
+            autostart=self._autostart_entry(),
+        )
 
     def _toggle_apk_category(self, category: str, expanded: bool) -> None:
         body = self._apk_accordion_bodies.get(category)
@@ -2652,6 +2736,7 @@ class MainWindow(QMainWindow):
                     row.setToolTip(f"Arquivo ausente: {path.name}\nColoque o APK em {path.parent}")
                     row.setText(f"{entry.label}  (ausente)")
             self._update_apk_accordion_label(cat)
+        self._sync_autostart_checkbox()
         self._append(
             self.txt_apps_out,
             f"APKs prontos: {available} • ausentes: {missing} • pasta: {self.apks_dir}",
@@ -2745,8 +2830,7 @@ class MainWindow(QMainWindow):
         # Mantém a UI alinhada com as dependências
         if any(e.category == "Painel" for e in entries):
             self._set_catalog_apk_checked(self._sintese_de_voz_entry(), True)
-        if any(e.category in ("Totem", "Painel") for e in entries):
-            self._set_catalog_apk_checked(self._autostart_entry(), True)
+        self._sync_autostart_checkbox()
         if not entries:
             QMessageBox.warning(self, APP_NAME, "Ative ao menos um aplicativo disponível.")
             return
@@ -2764,6 +2848,18 @@ class MainWindow(QMainWindow):
                         "Clique em «Baixar APKs» para obter os arquivos do repositório.",
                     )
                     return
+            autostart = self._autostart_entry()
+            if autostart is not None and any(
+                e.filename == autostart.filename for e in missing
+            ):
+                QMessageBox.warning(
+                    self,
+                    APP_NAME,
+                    "A instalação inclui o Autostart (autoinício no Mini PC).\n\n"
+                    f"APKs ausentes: {names}\n\n"
+                    "Clique em «Baixar APKs» para obter os arquivos do repositório.",
+                )
+                return
             QMessageBox.warning(
                 self,
                 APP_NAME,
@@ -2776,7 +2872,9 @@ class MainWindow(QMainWindow):
             e.filename == "Sintese_de_Voz.apk" for e in entries
         ):
             notes.append("Síntese de Voz (Painel)")
-        if any(e.category in ("Totem", "Painel") for e in entries):
+        if any(not self._is_autostart_apk(e) for e in entries) and any(
+            self._is_autostart_apk(e) for e in entries
+        ):
             notes.append("Autostart + props de firmware")
         if notes:
             self._append(
@@ -2789,11 +2887,14 @@ class MainWindow(QMainWindow):
         self._install_done = 0
         self._install_boot_packages = []
         self._install_boot_labels = {}
-        self._install_configure_boot = any(e.category in ("Totem", "Painel") for e in entries)
+        self._install_configure_boot = any(self._wants_boot_autostart(e) for e in entries)
         self._install_need_tts_config = any(
             e.post_install == "tts_pt_br_voice_v" for e in entries
         )
         self._install_tts_apk_ok = False
+        self._install_post_pending = bool(
+            self._install_need_tts_config or self._install_configure_boot
+        )
         self.btn_install.setEnabled(False)
         self._set_install_progress(0, animate=False)
         self._append(self.txt_apps_out, f"Fila: {self._install_total} app(s). Iniciando…")
@@ -2808,8 +2909,17 @@ class MainWindow(QMainWindow):
     def _on_install_progress_frame(self, value: int) -> None:
         self.lbl_apps_pct.setText(f"{int(value)}%")
 
+    def _on_install_phase_progress(self, percent: int, status: str) -> None:
+        # Nunca 100% enquanto a pós-instalação estiver em andamento
+        cap = 99 if self._install_post_pending else 100
+        self._set_install_progress(max(0, min(cap, int(percent))), animate=True)
+        if status:
+            self._append(self.txt_apps_out, status)
+
     def _set_install_progress(self, percent: int, *, animate: bool = True) -> None:
         target = max(0, min(100, int(percent)))
+        if self._install_post_pending:
+            target = min(target, 99)
         if self._install_progress_anim is None:
             self.progress_apps.setValue(target)
             self.lbl_apps_pct.setText(f"{target}%")
@@ -2824,9 +2934,11 @@ class MainWindow(QMainWindow):
         self._install_progress_anim.start()
 
     def _install_progress_percent(self) -> int:
-        if self._install_total <= 0:
-            return 0
-        return int(round(100.0 * self._install_done / self._install_total))
+        return install_apk_phase_percent(
+            self._install_done,
+            self._install_total,
+            has_post_install=self._install_post_pending,
+        )
 
     def _install_next_in_queue(self, serial: str) -> None:
         if not self._install_queue:
@@ -2848,36 +2960,66 @@ class MainWindow(QMainWindow):
             if need_tts or (need_boot and pkgs):
                 self._append(self.txt_apps_out, "Pós-instalação: TTS e/ou autoinício…")
                 boot_labels = dict(self._install_boot_labels)
+                report = self._install_phase_progress.emit
 
-                def post_fn() -> str:
+                def post_fn() -> tuple[str, bool]:
                     assert self.adb is not None
-                    import time
-
                     parts: list[str] = []
-                    # Durante a TTS, evita popup do Autostart; depois ele é reativado
+                    complete = True
+
                     self.adb.set_autostart_apps_enabled(serial, False)
-                    if need_tts:
-                        parts.append("=== FASE: Síntese de Voz ===")
-                        parts.append(self.adb.configure_tts_pt_br_voice_v(serial))
-                        self.adb.close_settings_and_tts_ui(serial)
-                        time.sleep(0.3)
-
-                    if need_boot and pkgs:
-                        parts.append("=== FASE: Autoinício (firmware + Autostart) ===")
-                        parts.append(
-                            self.adb.configure_boot_autostart(
-                                serial, pkgs, labels=boot_labels
+                    try:
+                        tts_ok = True
+                        if need_tts:
+                            report(62, "=== FASE: Síntese de Voz (idioma → país → Voz V) ===")
+                            tts: TtsConfigResult = self.adb.configure_tts_pt_br_voice_v(
+                                serial,
+                                manage_display=False,
+                                on_status=lambda m: report(70, m),
                             )
-                        )
-                    return "\n".join(parts) if parts else "Pós-instalação: nada a configurar."
+                            parts.append(tts.message)
+                            tts_ok = tts.voice_v_confirmed
+                            if not tts_ok:
+                                complete = False
+                                parts.append(
+                                    "AutoStart NÃO iniciado: a Voz V não foi confirmada."
+                                )
+                                report(75, "Voz V não confirmada — AutoStart adiado.")
+                            else:
+                                report(80, "Voz V confirmada.")
 
-                def post_ok(msg: str) -> None:
+                        if need_boot and pkgs and tts_ok:
+                            report(82, "=== FASE: Autoinício (firmware + Autostart) ===")
+                            boot: AutostartConfigResult = self.adb.configure_boot_autostart(
+                                serial, pkgs, labels=boot_labels, manage_display=False
+                            )
+                            parts.append(boot.message)
+                            if not boot.ok:
+                                complete = False
+                                report(90, "AutoStart: configuração incompleta.")
+                            else:
+                                report(95, "AutoStart confirmado.")
+                        elif need_boot and pkgs and not tts_ok:
+                            complete = False
+
+                        if complete:
+                            report(98, "Validação final…")
+                    finally:
+                        self.adb.close_settings_and_tts_ui(
+                            serial, stop_tts_engine=False
+                        )
+
+                    msg = "\n".join(parts) if parts else "Pós-instalação: nada a configurar."
+                    return msg, complete
+
+                def post_ok(result: tuple[str, bool]) -> None:
+                    msg, complete = result
                     self._append(self.txt_apps_out, msg)
-                    self._finish_install_queue()
+                    self._finish_install_queue(complete=complete)
 
                 def post_err(msg: str) -> None:
-                    self._append(self.txt_apps_out, f"Pós-instalação: falha parcial — {msg}")
-                    self._finish_install_queue()
+                    self._append(self.txt_apps_out, f"Pós-instalação: falha — {msg}")
+                    self._finish_install_queue(complete=False)
 
                 self.bg.run(post_fn, post_ok, post_err)
                 return
@@ -2885,9 +3027,9 @@ class MainWindow(QMainWindow):
             if need_boot and not pkgs:
                 self._append(
                     self.txt_apps_out,
-                    "Autoinício: não foi possível identificar os packages dos APKs Totem/Painel.",
+                    "Autoinício: não foi possível identificar os packages dos APKs instalados.",
                 )
-            self._finish_install_queue()
+            self._finish_install_queue(complete=True)
             return
 
         entry = self._install_queue.pop(0)
@@ -2900,21 +3042,21 @@ class MainWindow(QMainWindow):
         if entry.post_install == "tts_pt_br_voice_v":
             self._append(
                 self.txt_apps_out,
-                "Após o APK: configuração silenciosa da Síntese de Voz "
-                "(motor Google TTS, pt-BR, Voz V) — sem navegar Configurações na tela.",
+                "Após o APK: configuração rápida da Síntese de Voz "
+                "(Português → Brasil → Voz V).",
             )
 
         def fn() -> tuple[str, str | None]:
             assert self.adb is not None
 
             pkg_name = None
-            if entry.category in ("Totem", "Painel"):
+            if self._wants_boot_autostart(entry):
                 pkg_name = self.adb.package_name_from_apk(apk)
             if entry.post_install == "tts_pt_br_voice_v":
                 msg = self.adb.install_tts_apk(serial, apk)
             else:
                 msg = self.adb.install_apk(serial, apk)
-            if entry.category in ("Totem", "Painel") and not pkg_name:
+            if self._wants_boot_autostart(entry) and not pkg_name:
                 pkg_name = self.adb.package_name_from_apk(apk)
             return msg, pkg_name
 
@@ -2923,12 +3065,12 @@ class MainWindow(QMainWindow):
             self._append(self.txt_apps_out, f"OK • {entry.label}: {msg}")
             if entry.post_install == "tts_pt_br_voice_v":
                 self._install_tts_apk_ok = True
-            if entry.category in ("Totem", "Painel") and pkg_name:
+            if self._wants_boot_autostart(entry) and pkg_name:
                 if pkg_name not in self._install_boot_packages:
                     self._install_boot_packages.append(pkg_name)
                     self._install_boot_labels[pkg_name] = entry.label
                     self._append(self.txt_apps_out, f"Autoinício: marcado {entry.label} ({pkg_name})")
-            elif entry.category in ("Totem", "Painel") and not pkg_name:
+            elif self._wants_boot_autostart(entry) and not pkg_name:
                 self._append(
                     self.txt_apps_out,
                     f"Autoinício: não leu o package de {entry.filename} — "
@@ -2952,14 +3094,24 @@ class MainWindow(QMainWindow):
 
         self.bg.run(fn, ok, err)
 
-    def _finish_install_queue(self) -> None:
+    def _finish_install_queue(self, *, complete: bool = True) -> None:
         self._install_busy = False
         self._install_configure_boot = False
         self._install_need_tts_config = False
         self._install_tts_apk_ok = False
+        self._install_post_pending = False
         self.btn_install.setEnabled(True)
-        self._set_install_progress(100, animate=True)
-        self._append(self.txt_apps_out, "Instalação concluída.")
+        if complete:
+            self._set_install_progress(100, animate=True)
+            self._append(self.txt_apps_out, "Instalação concluída.")
+        else:
+            stuck = min(99, self.progress_apps.value())
+            self._set_install_progress(stuck, animate=False)
+            self._append(
+                self.txt_apps_out,
+                "Instalação incompleta: a barra não chega a 100% enquanto "
+                "a Voz V ou o AutoStart não forem confirmados.",
+            )
         self.refresh_apk_availability()
 
     @Slot()

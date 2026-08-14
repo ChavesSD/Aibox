@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import sys
 
 SPEC_DIR = Path(SPECPATH).resolve()
 ROOT = SPEC_DIR.parent
+sys.path.insert(0, str(ROOT))
+from aibox.theme import APP_VERSION
+from installer.versioninfo import write_version_file
 
 PAYLOAD = ROOT / "build" / "installer_payload" / "aibox_payload.zip"
 ICON_ICO = ROOT / "aibox" / "Aibox.ico"
@@ -55,6 +59,18 @@ exe_kwargs = {
 }
 if icon.exists():
     exe_kwargs["icon"] = str(icon)
+
+version_file = write_version_file(
+    ROOT / "build" / "version" / "Aibox-Setup_version.txt",
+    version=APP_VERSION,
+    filename="Aibox-Setup.exe",
+    description="Instalador Aibox — Intelite",
+)
+exe_kwargs["version"] = str(version_file)
+manifest = SPEC_DIR / "Aibox-Setup.exe.manifest"
+if manifest.is_file():
+    exe_kwargs["manifest"] = str(manifest)
+exe_kwargs["uac_admin"] = True
 
 exe = EXE(
     pyz,

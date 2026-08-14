@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = Path(SPECPATH).resolve()
 PKG = ROOT / "aibox"
+sys.path.insert(0, str(ROOT))
+from aibox.theme import APP_VERSION
+from installer.versioninfo import write_version_file
 
 # ADB mínimo necessário no Windows (sem NOTICE gigante / tools extras).
 _ADB_FILES = (
@@ -99,6 +103,17 @@ exe_kwargs = {
 }
 if icon.exists():
     exe_kwargs["icon"] = str(icon)
+
+version_file = write_version_file(
+    ROOT / "build" / "version" / "Aibox_version.txt",
+    version=APP_VERSION,
+    filename="Aibox.exe",
+    description="Aibox — Intelite",
+)
+exe_kwargs["version"] = str(version_file)
+manifest = ROOT / "installer" / "Aibox.exe.manifest"
+if manifest.is_file():
+    exe_kwargs["manifest"] = str(manifest)
 
 exe = EXE(
     pyz,

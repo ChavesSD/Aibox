@@ -382,6 +382,56 @@ def _try_inno_setup(version: str) -> Path | None:
     return out if out.exists() else None
 
 
+def _find_signtool() -> Path | None:
+    which = shutil.which("signtool")
+    if which:
+        return Path(which)
+    kits = Path(r"C:\Program Files (x86)\Windows Kits\10\bin")
+    if kits.is_dir():
+        found = sorted(kits.glob(r"*\x64\signtool.exe"), reverse=True)
+        if found:
+            return found[0]
+    return None
+
+
+def _try_sign(path: Path) -> None:
+    """Assina o .exe se AIBOX_PFX ou AIBOX_CERT_THUMBPRINT estiver definido."""
+    if not path.is_file():
+        return
+    pfx = os.environ.get("AIBOX_PFX", "").strip()
+    thumb = os.environ.get("AIBOX_CERT_THUMBPRINT", "").strip()
+    if not pfx and not thumb:
+        return
+    signtool = _find_signtool()
+    if signtool is None:
+        print("AVISO: signtool não encontrado; EXE não assinado.", file=sys.stderr)
+        return
+    cmd = [
+        str(signtool),
+        "sign",
+        "/fd",
+        "SHA256",
+        "/td",
+        "SHA256",
+        "/tr",
+        "http://timestamp.digicert.com",
+    ]
+    if pfx:
+        cmd += ["/f", pfx]
+        password = os.environ.get("AIBOX_PFX_PASSWORD", "")
+        if password:
+            cmd += ["/p", password]
+    else:
+        cmd += ["/sha1", thumb]
+    cmd.append(str(path))
+    rc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if rc.returncode != 0:
+        err = (rc.stderr or rc.stdout or "").strip()
+        print(f"AVISO: falha ao assinar {path.name}: {err}", file=sys.stderr)
+        return
+    print(f"Assinado: {path}")
+
+
 def _copy_pyinstaller_setup() -> Path | None:
     setup_src = ROOT / "dist" / "Aibox-Setup.exe"
     if not setup_src.exists():
@@ -393,6 +443,12 @@ def _copy_pyinstaller_setup() -> Path | None:
     DIST_RELEASE.mkdir(parents=True, exist_ok=True)
     setup_dst = DIST_RELEASE / "Aibox-Setup.exe"
     shutil.copy2(setup_src, setup_dst)
+    try:
+        from installer.windows_trust import unblock_file
+
+        unblock_file(setup_dst)
+    except Exception:
+        pass
     return setup_dst
 
 
@@ -420,6 +476,7 @@ def main() -> int:
         return 2
 
     _copy_adb_into_dist()
+    _try_sign(out)
 
     version = _app_version()
     (DIST_APP / "version.txt").write_text(version + "\n", encoding="utf-8")
@@ -448,6 +505,9 @@ def main() -> int:
         setup_kind = "PyInstaller"
         if setup_dst is None:
             print("AVISO: Aibox-Setup.exe não foi gerado.", file=sys.stderr)
+
+    if setup_dst:
+        _try_sign(setup_dst)
 
     print()
     print(f"OK: {out}")

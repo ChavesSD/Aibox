@@ -99,6 +99,17 @@ class TestApksManifest(unittest.TestCase):
             plan = plan_apk_sync(m, root=root)
         self.assertEqual(plan[0].status, "missing")
 
+    def test_releases_mirror_urls(self) -> None:
+        from aibox.apk_sync import releases_mirror_urls
+
+        url = "https://raw.githubusercontent.com/ChavesSD/ReleasesAibox/main/apks.json"
+        mirrors = releases_mirror_urls(url)
+        self.assertEqual(mirrors[0], url)
+        self.assertIn(
+            "https://cdn.jsdelivr.net/gh/ChavesSD/ReleasesAibox@main/apks.json",
+            mirrors,
+        )
+
 
 class TestChecksumAndExtract(unittest.TestCase):
     def test_sha_and_extract(self) -> None:

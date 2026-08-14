@@ -1,0 +1,17 @@
+{
+  "version": "1.0.1",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-14",
+  "notes": {
+    "added": [
+      "Autostart marcado e instalado automaticamente com qualquer APK",
+      "Configuração da Síntese de Voz: português (Brasil) e Voz V"
+    ],
+    "fixed": [
+      "Espera o download da voz pt-BR antes de selecionar a Voz V",
+      "Configuração do Autostart mais rápida no Mini PC"
+    ],
+    "removed": []
+  }
+}

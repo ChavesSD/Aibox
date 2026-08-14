@@ -50,6 +50,10 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{a
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -Command ""Unblock-File -LiteralPath '{app}' -Recurse -ErrorAction SilentlyContinue; try {{ Add-MpPreference -ExclusionPath '{app}' }} catch {{ }}"""; \
+    Flags: runhidden waituntilterminated; \
+    StatusMsg: "Permitindo o Aibox no Windows…"
 Filename: "{app}\{#MyAppExeName}"; Description: "Abrir o Aibox agora"; Flags: nowait postinstall skipifsilent; WorkingDir: "{app}"
 
 [UninstallDelete]

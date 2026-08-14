@@ -11,6 +11,8 @@ import threading
 import zipfile
 from pathlib import Path
 
+from installer.windows_trust import smart_app_control_active, trust_installed_app
+
 INSTALL_DIR = Path(r"C:\Aibox")
 APP_EXE_NAME = "Aibox.exe"
 PAYLOAD_NAME = "aibox_payload.zip"
@@ -236,6 +238,8 @@ def perform_install(progress=None) -> Path:
     _create_shortcut(exe, desktop, INSTALL_DIR)
     _create_shortcut(exe, start_menu, INSTALL_DIR)
     _write_uninstaller(INSTALL_DIR)
+    report(0.97, "Permitindo o Aibox no Windows…")
+    trust_installed_app(INSTALL_DIR)
     report(1.0, "Instalação concluída.")
     return exe
 
@@ -342,6 +346,16 @@ def run_gui() -> int:
         install_btn.pack_forget()
         open_btn.pack(side="right")
         close_btn.configure(text="Fechar")
+        if smart_app_control_active():
+            _message(
+                "Aibox — Windows",
+                "O Controle inteligente de aplicativos deste PC pode bloquear o Aibox "
+                "(o instalador ainda não tem certificado de código).\n\n"
+                "Se o app não abrir:\n"
+                "1. Segurança do Windows → Controle de aplicativos e navegador\n"
+                "2. Controle inteligente de aplicativos → Desativado\n"
+                "3. Ou, no aviso do Windows, clique em Mais informações → Executar mesmo assim.",
+            )
 
     def finish_err(msg: str) -> None:
         result["busy"] = False
@@ -368,12 +382,15 @@ def run_gui() -> int:
     def open_app() -> None:
         exe = result.get("exe")
         if exe and Path(exe).is_file():
-            subprocess.Popen(
-                [str(exe)],
-                cwd=str(INSTALL_DIR),
-                close_fds=True,
-                creationflags=0x00000008 | 0x00000200,
-            )
+            try:
+                os.startfile(str(exe))  # type: ignore[attr-defined]
+            except OSError:
+                subprocess.Popen(
+                    [str(exe)],
+                    cwd=str(INSTALL_DIR),
+                    close_fds=True,
+                    creationflags=0x00000008 | 0x00000200,
+                )
         root.destroy()
 
     def on_close() -> None:

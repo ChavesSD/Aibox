@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +19,27 @@ from .usbwin import allwinner_mode, list_present_usb, samsung_mtp_present
 
 class AdbError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class TtsConfigResult:
+    """Resultado da configuração silenciosa da Síntese de Voz / Voz V."""
+
+    voice_v_confirmed: bool
+    engine_locale_ok: bool
+    message: str
+
+    @property
+    def ok(self) -> bool:
+        return self.voice_v_confirmed
+
+
+@dataclass(frozen=True)
+class AutostartConfigResult:
+    """Resultado da configuração do AutoStart (UI + firmware)."""
+
+    ok: bool
+    message: str
 
 
 @dataclass(frozen=True)
@@ -223,6 +246,7 @@ class Adb:
     def __init__(self, adb_path: str | None = None) -> None:
         self.adb_path = adb_path or find_adb()
         self._adb_dir = str(Path(self.adb_path).resolve().parent)
+        self._display_blanked = False
         self._ensure_server()
 
     def _adb_env(self) -> dict[str, str]:
@@ -747,16 +771,15 @@ class Adb:
             out = self.shell_lax(
                 serial,
                 f"cmd package resolve-activity --brief -c {category} {package}",
-                timeout_s=15,
+                timeout_s=5,
             )
             comp = self._parse_component_from_resolve(out, package)
             if comp:
                 return comp
-        # Fallback dumpsys
         dump = self.shell_lax(
             serial,
             f"dumpsys package {package} | grep -E 'android.intent.action.MAIN|LEANBACK_LAUNCHER|LAUNCHER' -A2 | head -n 40",
-            timeout_s=20,
+            timeout_s=8,
         )
         m = re.search(
             rf"({re.escape(package)}/[a-zA-Z0-9_$.]+)",
@@ -810,16 +833,26 @@ class Adb:
 
     def set_autostart_apps_enabled(self, serial: str, enabled: bool) -> None:
         """Desativa/ativa o Autostart (pm disable-user). force-stop sozinho não basta."""
-        pkgs = self.list_autostart_packages(serial)
+        pkgs = (
+            "com.droidlogic.app.Autostart",
+            "com.android.autostart",
+            "com.autostart",
+            "com.softwinner.autostart",
+            "com.android.rockchip.autostart",
+        )
         if enabled:
-            for pkg in pkgs:
-                self.shell_try(serial, f"pm enable {pkg}", timeout_s=4)
-        else:
-            self.force_stop_autostart_apps(serial)
-            for pkg in pkgs:
-                self.shell_try(serial, f"pm disable-user --user 0 {pkg}", timeout_s=4)
-                self.shell_try(serial, f"pm disable {pkg}", timeout_s=3)
-                self.shell_try(serial, f"am force-stop {pkg}", timeout_s=2)
+            self.shell_try(
+                serial,
+                "; ".join(f"pm enable {p}" for p in pkgs),
+                timeout_s=5,
+            )
+            return
+        self.force_stop_autostart_apps(serial)
+        cmds: list[str] = []
+        for pkg in pkgs:
+            cmds.append(f"pm disable-user --user 0 {pkg}")
+            cmds.append(f"am force-stop {pkg}")
+        self.shell_try(serial, "; ".join(cmds), timeout_s=6)
 
     def _ensure_autostart_dead(self, serial: str) -> None:
         """Garante que Autostart não está na frente (entre passos da TTS)."""
@@ -842,16 +875,29 @@ class Adb:
     def _tap_only(self, serial: str, x: int, y: int) -> bool:
         return self.shell_try(serial, f"input tap {x} {y}", timeout_s=3) is not None
 
-    def close_settings_and_tts_ui(self, serial: str) -> None:
-        """Fecha telas de Configurações/TTS antes de abrir o Autostart."""
-        self.shell_try(
-            serial,
-            "am force-stop com.android.tv.settings; "
-            "am force-stop com.android.settings; "
-            "am force-stop com.google.android.tts; "
-            "input keyevent 3",
-            timeout_s=5,
-        )
+    def close_settings_and_tts_ui(
+        self,
+        serial: str,
+        *,
+        stop_tts_engine: bool = False,
+        go_home: bool = False,
+    ) -> None:
+        """Sai das telas de Configurações/instalador TTS.
+
+        HOME (keyevent 3) mostra o launcher e interrompe a TTS — só use
+        go_home=True depois da sessão silenciosa, se precisar.
+        """
+        parts = [
+            "am force-stop com.android.tv.settings",
+            "am force-stop com.android.settings",
+            "input keyevent 4",
+            "input keyevent 4",
+        ]
+        if stop_tts_engine:
+            parts.append("am force-stop com.google.android.tts")
+        if go_home:
+            parts.append("input keyevent 3")
+        self.shell_try(serial, "; ".join(parts), timeout_s=5)
 
     @staticmethod
     def _fq_activity_class(package: str, activity: str) -> str:
@@ -878,13 +924,11 @@ class Adb:
         packages: list[str],
         *,
         labels: dict[str, str] | None = None,
-    ) -> str:
-        """Configura Totem/Painel para iniciar no boot.
+        manage_display: bool = True,
+    ) -> AutostartConfigResult:
+        """Configura os APKs instalados para iniciar no boot.
 
-        1) appops / whitelist
-        2) props persist.sys.boot* com activity em nome completo (FQCN)
-        3) tenta HOME/launcher (só funciona se o app tiver CATEGORY_HOME)
-        4) se Autostart.apk estiver instalado: liga e marca os apps na UI
+        Só deve ser chamado depois da Voz V confirmada, se a fila tiver TTS.
         """
         labels = labels or {}
         pkgs = []
@@ -893,133 +937,87 @@ class Adb:
             p = (p or "").strip()
             if not p or p in seen:
                 continue
-            # Nunca trata o próprio Autostart como app de boot
             if "autostart" in p.lower():
                 continue
             seen.add(p)
             pkgs.append(p)
         if not pkgs:
-            return "Autoinício: nenhum pacote Totem/Painel para configurar."
+            return AutostartConfigResult(
+                ok=False,
+                message="Autoinício: nenhum pacote de aplicativo para configurar.",
+            )
+
+        display_state: dict[str, str] = {}
+        if manage_display:
+            display_state = self._tts_hide_display(serial)
 
         lines: list[str] = ["=== Autoinício no boot ==="]
+        ui_ok = False
+        try:
+            ui_ok = self._configure_boot_autostart_body(
+                serial, pkgs, labels=labels, lines=lines
+            )
+        finally:
+            if manage_display:
+                self._tts_restore_display(serial, display_state)
 
-        components: dict[str, str] = {}
-        for pkg in pkgs:
-            self.shell_try(serial, f"pm enable {pkg}", timeout_s=6)
-            for op in (
-                "APP_AUTO_START",
-                "RUN_IN_BACKGROUND",
-                "RUN_ANY_IN_BACKGROUND",
-                "START_FOREGROUND",
-            ):
-                self.shell_try(serial, f"appops set {pkg} {op} allow", timeout_s=4)
-            self.shell_try(serial, f"dumpsys deviceidle whitelist +{pkg}", timeout_s=4)
-            comp = self.launchable_component(serial, pkg)
-            if comp:
-                components[pkg] = comp
-                lines.append(f"• {pkg} → {comp}")
-            else:
-                lines.append(f"• {pkg} → (activity lançável não encontrada)")
+        return AutostartConfigResult(ok=ui_ok, message="\n".join(lines))
+
+    def _configure_boot_autostart_body(
+        self,
+        serial: str,
+        pkgs: list[str],
+        *,
+        labels: dict[str, str],
+        lines: list[str],
+    ) -> bool:
 
         primary = pkgs[0]
         primary_label = labels.get(primary, primary)
-        primary_comp = components.get(primary)
+        self.shell_try(
+            serial,
+            "; ".join(
+                [f"pm enable {p}" for p in pkgs]
+                + [f"appops set {p} APP_AUTO_START allow" for p in pkgs]
+            ),
+            timeout_s=8,
+        )
+        primary_comp = self.launchable_component(serial, primary)
+        if primary_comp:
+            lines.append(f"• {primary} → {primary_comp}")
+        else:
+            lines.append(f"• {primary} → (activity lançável não encontrada)")
         primary_activity_raw = None
         if primary_comp and "/" in primary_comp:
             primary_activity_raw = primary_comp.split("/", 1)[1]
         primary_activity = self._fq_activity_class(primary, primary_activity_raw or "")
-        # Componente com FQCN (melhor para props/firmware)
-        primary_comp_fq = (
-            f"{primary}/{primary_activity}" if primary_activity else primary_comp
-        )
 
-        prop_ok = 0
-        if primary_activity and primary_comp_fq:
-            # KickPI/Allwinner: bootAppClass deve ser FQCN (não ".SplashActivity")
-            prop_cmds = [
-                f"setprop persist.sys.bootAppPack {primary}",
-                f"setprop persist.sys.bootAppClass {primary_activity}",
-                f"setprop persist.sys.bootpackage {primary}",
+        if primary_activity:
+            self.shell_try(
+                serial,
+                f"setprop persist.sys.bootAppPack {primary}; "
+                f"setprop persist.sys.bootAppClass {primary_activity}; "
+                f"setprop persist.sys.bootpackage {primary}; "
                 f"setprop persist.sys.bootactivity {primary_activity}",
-                f"setprop persist.sys.boot_app {primary_comp_fq}",
-                f"setprop persist.sys.bootpkg {primary}",
-                f"setprop persist.sys.boot_activity {primary_activity}",
-                f"setprop persist.vendor.bootpackage {primary}",
-                f"setprop persist.vendor.bootactivity {primary_activity}",
-                f"setprop persist.sys.bootapp {primary}",
-                f"setprop persist.sys.custom_launcher {primary_comp_fq}",
-            ]
-            # Também grava forma relativa (alguns firmwares legados)
-            if primary_activity_raw and primary_activity_raw != primary_activity:
-                prop_cmds.extend(
-                    [
-                        f"setprop persist.sys.bootAppClassRel {primary_activity_raw}",
-                    ]
-                )
-            for cmd in prop_cmds:
-                out = self.shell_try(serial, cmd, timeout_s=4) or ""
-                low = out.lower()
-                if "denied" in low or "error" in low or "failed" in low:
-                    continue
-                prop_ok += 1
-
-            check_class = (
-                self.shell_try(serial, "getprop persist.sys.bootAppClass", timeout_s=4)
-                or ""
-            ).strip()
-            check_pack = (
-                self.shell_try(serial, "getprop persist.sys.bootAppPack", timeout_s=4)
-                or ""
-            ).strip()
-            if check_pack == primary and primary_activity in check_class:
-                lines.append(
-                    f"Firmware boot: OK — «{primary_label}» "
-                    f"({primary} / {primary_activity})."
-                )
-            elif prop_ok:
-                lines.append(
-                    f"Firmware boot: props enviadas para «{primary_label}» "
-                    f"({prop_ok} comandos, class={primary_activity}). Valide após reiniciar."
-                )
-            else:
-                lines.append(
-                    "Firmware boot: setprop sem efeito visível "
-                    "(algumas imagens bloqueiam props sem root)."
-                )
+                timeout_s=5,
+            )
+            lines.append(
+                f"Firmware boot: «{primary_label}» ({primary} / {primary_activity})."
+            )
         else:
             lines.append("Firmware boot: sem activity do app principal — props não aplicadas.")
 
-        # HOME só funciona se o APK declarar CATEGORY_HOME (Painel normalmente não declara)
-        if primary_comp_fq:
-            home = self.shell_try(
-                serial,
-                f"cmd package set-home-activity --user 0 {primary_comp_fq}",
-                timeout_s=10,
-            ) or ""
-            home2 = self.shell_try(
-                serial,
-                f"cmd package set-home-activity {primary_comp_fq}",
-                timeout_s=10,
-            ) or ""
-            home_all = f"{home}\n{home2}".lower()
-            if "error" in home_all or "exception" in home_all or "failed" in home_all:
-                lines.append(
-                    "Launcher/home: app sem CATEGORY_HOME "
-                    "(esperado) — autoinício depende de firmware/Autostart."
-                )
-            else:
-                lines.append(f"Launcher/home: «{primary_label}» ({primary_comp_fq}).")
-
         # Caminho confiável neste Mini PC: Autostart.apk
         auto_pkg = self._resolve_autostart_package(serial)
+        ui_ok = False
         if auto_pkg:
-            self.set_autostart_apps_enabled(serial, True)
+            self.shell_try(serial, f"pm enable {auto_pkg}", timeout_s=3)
             lines.append(f"APK Autostart: {auto_pkg} (habilitado)")
-            lines.append(
-                self._configure_autostart_app_ui(
-                    serial, auto_pkg, pkgs, labels=labels
-                )
+            ui = self._configure_autostart_app_ui(
+                serial, auto_pkg, pkgs, labels=labels
             )
+            lines.append(ui.message)
+            ui_ok = ui.ok
         else:
             lines.append(
                 "APK Autostart: não instalado — neste firmware as props sozinhas "
@@ -1033,27 +1031,20 @@ class Adb:
             )
 
         lines.append("Reinicie o Mini PC para validar o autoinício.")
-        return "\n".join(lines)
+        return ui_ok
 
     def _resolve_autostart_package(self, serial: str) -> str | None:
-        out = self.shell_lax(serial, "pm list packages | grep -i autostart", timeout_s=15)
         preferred = (
             "com.droidlogic.app.Autostart",
             "com.android.autostart",
             "com.autostart",
+            "com.softwinner.autostart",
         )
-        found: list[str] = []
-        for line in (out or "").splitlines():
-            line = line.strip()
-            if not line.startswith("package:"):
-                continue
-            pkg = line.split(":", 1)[-1].strip()
-            if pkg:
-                found.append(pkg)
         for p in preferred:
-            if p in found:
+            out = self.shell_try(serial, f"pm path {p}", timeout_s=3) or ""
+            if "package:" in out or ".apk" in out:
                 return p
-        return found[0] if found else None
+        return None
 
     def _configure_autostart_app_ui(
         self,
@@ -1062,172 +1053,129 @@ class Adb:
         packages: list[str],
         *,
         labels: dict[str, str] | None = None,
-    ) -> str:
-        """Fluxo Autostart persistente:
-
-        1) Abrir app e fechar overlays (Play login / update)
-        2) ToggleButton OFF → ON
-        3) ADD → tocar a linha do app (mesmo sem clickable)
-        4) Fechar com BACK (nunca force-stop — senão não grava)
-        5) Reabrir e verificar ON + apps na lista
-        """
-        import time
+    ) -> AutostartConfigResult:
+        """Fluxo Autostart persistente e rápido: abrir, ligar, ADD, tocar o app, BACK."""
 
         labels = labels or {}
-        auto_pkgs = set(self.list_autostart_packages(serial))
-        auto_pkgs.add(auto_pkg)
-        targets = [p for p in packages if p not in auto_pkgs]
+        skip = {
+            auto_pkg,
+            "com.droidlogic.app.Autostart",
+            "com.android.autostart",
+            "com.autostart",
+            "com.softwinner.autostart",
+            "com.android.rockchip.autostart",
+        }
+        targets = [p for p in packages if p not in skip]
 
-        # Não use force-stop no Autostart durante a config
+        # Não use HOME: mostra o launcher e tira o foco do AutoStart
         self.shell_try(
             serial,
             "am force-stop com.android.tv.settings; "
-            "am force-stop com.android.settings; "
-            "input keyevent 3",
+            "am force-stop com.android.settings",
             timeout_s=4,
         )
-        time.sleep(0.08)
 
         self.shell_try(serial, f"pm enable {auto_pkg}", timeout_s=3)
         if not self._open_autostart_main(serial, auto_pkg):
-            return "UI Autostart: não abriu — configure manualmente."
+            return AutostartConfigResult(
+                ok=False,
+                message="UI Autostart: não abriu — configure manualmente.",
+            )
 
         notes: list[str] = []
         self._ui_dismiss_autostart_overlays(serial)
-        time.sleep(0.1)
 
-        if self._ui_turn_on_autostart(serial):
-            notes.append("Auto startup=ON")
-        else:
-            notes.append("Auto startup: falhou ao ligar")
-        time.sleep(0.08)
+        on_ok = self._ui_turn_on_autostart(serial)
+        notes.append("Auto startup=ON" if on_ok else "Auto startup: falhou ao ligar")
 
         enabled = 0
         for pkg in targets:
             nice = (labels.get(pkg) or "").strip()
-            search_labels: list[str] = []
-            if nice:
-                search_labels.extend(
-                    [
-                        nice,
-                        nice.replace(" ", ""),
-                        # UI do Autostart costuma mostrar "Nome - Painel/Totem"
-                        f"{nice} - Painel",
-                        f"{nice} - Totem",
-                        f"{nice} - Painel Cirurgico",
-                    ]
-                )
-            search_labels.extend(
-                [
-                    "Atendimento Inteligente - Painel",
-                    "Atendimento Inteligente - Totem",
-                    "Painel Cirurgico",
-                    "Totem Interativo",
-                    pkg.rsplit(".", 1)[-1],
-                ]
-            )
-            for extra in (
-                "Atendimento Inteligente",
-                "Atendimento",
-                "Painel",
-                "Totem",
-                "Aiclass",
-                "Ainurse",
-                "Aifit",
-                "Upzz",
-            ):
-                if nice and extra.lower() in nice.lower():
-                    search_labels.append(extra)
-                elif not nice:
-                    search_labels.append(extra)
-
-            # Já está na lista principal?
-            if self._ui_autostart_has_app(serial, tuple(dict.fromkeys(search_labels))):
-                enabled += 1
-                continue
+            search = self._autostart_app_search_labels(pkg, nice)
 
             if not self._ui_open_applications_add(serial):
                 notes.append(f"ADD falhou ({nice or pkg})")
                 continue
-            time.sleep(0.12)
 
-            if self._ui_pick_autostart_app_from_list(
-                serial, tuple(dict.fromkeys(search_labels))
-            ):
+            if self._ui_pick_autostart_app_from_list(serial, search):
                 enabled += 1
-                time.sleep(0.12)
             else:
                 self.shell_try(serial, "input keyevent 4", timeout_s=2)
-                time.sleep(0.08)
                 notes.append(f"não achou na lista: {nice or pkg}")
 
         notes.append(f"apps na lista: {enabled}/{len(targets)}")
+        self.shell_try(serial, "input keyevent 4; input keyevent 4", timeout_s=3)
+        apps_ok = enabled >= len(targets) if targets else True
+        ok = bool(on_ok and apps_ok)
+        if not ok:
+            notes.append("validação: incompleta")
+        return AutostartConfigResult(ok=ok, message="UI Autostart: " + "; ".join(notes))
 
-        # Confirma na tela atual (sem reabrir — economiza ~20–40s)
-        xml = self._dump_ui_xml(serial) or ""
-        on_ok = self._ui_autostart_is_on(xml)
-        notes.append(f"confirma: startup={'ON' if on_ok else 'OFF'}")
-
-        # Grava preferências: BACK/HOME (nunca force-stop)
-        self.shell_try(serial, "input keyevent 4; input keyevent 3", timeout_s=3)
-        time.sleep(0.12)
-        return "UI Autostart: " + "; ".join(notes)
+    @staticmethod
+    def _autostart_app_search_labels(pkg: str, nice: str) -> tuple[str, ...]:
+        labels: list[str] = []
+        if nice:
+            labels.extend(
+                [
+                    nice,
+                    f"{nice} - Painel",
+                    f"{nice} - Totem",
+                    nice.replace(" ", ""),
+                ]
+            )
+        tail = (pkg or "").rsplit(".", 1)[-1]
+        if tail:
+            labels.append(tail)
+        return tuple(dict.fromkeys(x for x in labels if x.strip()))
 
     def _open_autostart_main(self, serial: str, auto_pkg: str) -> bool:
         import time
 
-        comp = self.launchable_component(serial, auto_pkg)
-        if comp:
-            try:
-                out = self.shell_combined(serial, f"am start -n {comp}", timeout_s=8)
-                if self._am_start_succeeded(out) or "starting:" in (out or "").lower():
-                    time.sleep(0.35)
-                    return True
-            except AdbError:
-                pass
         try:
             out = self.shell_combined(
                 serial,
                 f"monkey -p {auto_pkg} -c android.intent.category.LAUNCHER 1",
-                timeout_s=8,
+                timeout_s=5,
             )
             ok = "events injected" in (out or "").lower() or "starting" in (out or "").lower()
             if ok:
-                time.sleep(0.35)
-            return ok
+                time.sleep(0.18)
+                return True
+        except AdbError:
+            pass
+        comp = self.launchable_component(serial, auto_pkg)
+        if not comp:
+            return False
+        try:
+            out = self.shell_combined(serial, f"am start -n {comp}", timeout_s=5)
+            if self._am_start_succeeded(out) or "starting:" in (out or "").lower():
+                time.sleep(0.18)
+                return True
         except AdbError:
             return False
+        return False
 
     def _ui_dismiss_autostart_overlays(self, serial: str) -> None:
-        """Fecha Play login / update que cobrem a tela principal do Autostart."""
-        import time
-
-        for _ in range(3):
-            xml = (self._dump_ui_xml(serial) or "").lower()
-            if "auto startup" in xml and (
-                "togglebutton" in xml or 'text="off"' in xml or 'text="on"' in xml
-            ):
-                self._ui_dismiss_autostart_update_dialog(serial)
-                return
-            if any(
-                k in xml
-                for k in (
-                    "fazer login",
-                    "faça login",
-                    "faca login",
-                    "sign in",
-                    "google play",
-                    "melhores apps",
-                )
-            ):
-                self.shell_try(serial, "input keyevent 4", timeout_s=2)
-                time.sleep(0.12)
-                continue
-            if self._ui_dismiss_autostart_update_dialog(serial):
-                time.sleep(0.1)
-                continue
+        """Fecha Play login / update com no máximo 1 dump."""
+        xml = self._dump_ui_xml(serial) or ""
+        low = xml.lower()
+        if self._ui_autostart_update_dialog_open(low):
+            self._ui_dismiss_autostart_update_dialog(serial, xml=xml)
+            return
+        if "auto startup" in low:
+            return
+        if any(
+            k in low
+            for k in (
+                "fazer login",
+                "faça login",
+                "faca login",
+                "sign in",
+                "google play",
+                "melhores apps",
+            )
+        ):
             self.shell_try(serial, "input keyevent 4", timeout_s=2)
-            time.sleep(0.1)
 
     @staticmethod
     def _ui_autostart_is_on(xml: str) -> bool:
@@ -1235,6 +1183,22 @@ class Adb:
         if 'text="on"' in low or "text='on'" in low:
             return 'text="off"' not in low and "text='off'" not in low
         return 'class="android.widget.togglebutton"' in low and 'checked="true"' in low
+
+    @staticmethod
+    def _ui_autostart_update_dialog_open(xml: str) -> bool:
+        low = (xml or "").lower()
+        has_procurar = any(
+            t in low
+            for t in (
+                "procurar atualiza",
+                "buscar atualiza",
+                "procurar atualizações",
+                "buscar atualizações",
+                "check for update",
+            )
+        )
+        has_ok = bool(re.search(r'(?:text|content-desc)="ok"', low))
+        return has_procurar and has_ok
 
     def _ui_autostart_has_app(self, serial: str, labels: tuple[str, ...]) -> bool:
         xml = (self._dump_ui_xml(serial) or "").lower()
@@ -1253,11 +1217,13 @@ class Adb:
         labels: tuple[str, ...],
         *,
         prefer_left: bool = False,
+        xml: str | None = None,
     ) -> bool:
         """Toca o bounds do texto mesmo se clickable=false (lista ADD do Autostart)."""
         import xml.etree.ElementTree as ET
 
-        xml = self._dump_ui_xml(serial)
+        if xml is None:
+            xml = self._dump_ui_xml(serial)
         if not (xml or "").strip().startswith("<"):
             return False
         try:
@@ -1299,74 +1265,52 @@ class Adb:
         return self._tap_only(serial, best[1], best[2])
 
     def _ui_pick_autostart_app_from_list(self, serial: str, labels: tuple[str, ...]) -> bool:
-        """Na tela ADD: seleciona o app pela linha (ícone/texto)."""
-        import time
-
-        for _ in range(6):
-            xml = (self._dump_ui_xml(serial) or "").lower()
-            if "auto startup" in xml and any((lab or "").lower() in xml for lab in labels if lab):
-                if 'text="add"' in xml or "text='add'" in xml:
-                    return True
-            if self._ui_tap_label_anywhere(serial, labels, prefer_left=True):
-                time.sleep(0.18)
-                xml2 = (self._dump_ui_xml(serial) or "").lower()
-                if "auto startup" in xml2 and any(
-                    (lab or "").lower() in xml2 for lab in labels if lab
-                ):
-                    return True
-            self.shell_try(
-                serial,
-                "input keyevent 20; input keyevent 20; input keyevent 20; "
-                "input keyevent 20; input keyevent 20; input keyevent 20",
-                timeout_s=2,
-            )
-            time.sleep(0.04)
-        return False
-
-    def _ui_turn_on_autostart(self, serial: str) -> bool:
-        """Liga o ToggleButton OFF → ON."""
+        """Na tela ADD: um dump, toca o app; se falhar, rola uma vez."""
         import time
 
         xml = self._dump_ui_xml(serial) or ""
+        low = xml.lower()
+        if "auto startup" in low and (
+            'text="add"' in low or "text='add'" in low
+        ):
+            return True
+        if self._ui_tap_label_anywhere(serial, labels, prefer_left=True, xml=xml):
+            time.sleep(0.1)
+            return True
+        self.shell_try(
+            serial,
+            "input keyevent 20; input keyevent 20; input keyevent 20; "
+            "input keyevent 20; input keyevent 20; input keyevent 20",
+            timeout_s=2,
+        )
+        xml = self._dump_ui_xml(serial) or ""
+        return self._ui_tap_label_anywhere(serial, labels, prefer_left=True, xml=xml)
+
+    def _ui_turn_on_autostart(self, serial: str) -> bool:
+        """Liga o ToggleButton OFF → ON (1 dump)."""
+        xml = self._dump_ui_xml(serial) or ""
         if self._ui_autostart_is_on(xml):
             return True
-
-        if self._ui_tap_label_anywhere(serial, ("OFF", "Off"), prefer_left=False):
-            time.sleep(0.12)
-            return self._ui_autostart_is_on(self._dump_ui_xml(serial) or "")
-
-        if self._ui_navigate_step(
-            serial, ("OFF", "Off"), scrolls=0, pause=0.05, guard_autostart=False
-        ):
-            time.sleep(0.1)
-            return self._ui_autostart_is_on(self._dump_ui_xml(serial) or "")
-        return False
+        return self._ui_tap_label_anywhere(serial, ("OFF", "Off"), xml=xml)
 
     def _ui_open_applications_add(self, serial: str) -> bool:
-        """Abre o botão ADD da tela principal."""
+        """Abre o botão ADD da tela principal (1 dump)."""
         import time
 
-        xml = (self._dump_ui_xml(serial) or "").lower()
-        if "show all applications" in xml:
+        xml = self._dump_ui_xml(serial) or ""
+        low = xml.lower()
+        if "show all applications" in low:
             return True
+        if self._ui_tap_label_anywhere(
+            serial, ("ADD", "Add", "Adicionar"), xml=xml
+        ):
+            time.sleep(0.1)
+            return True
+        return False
 
-        if self._ui_tap_label_anywhere(serial, ("ADD", "Add", "Adicionar"), prefer_left=False):
-            time.sleep(0.18)
-            xml2 = (self._dump_ui_xml(serial) or "").lower()
-            return "show all applications" in xml2 or any(
-                k in xml2
-                for k in ("facebook", "netflix", "spotify", "atendimento", "painel", "totem")
-            )
-
-        return self._ui_navigate_step(
-            serial,
-            ("ADD", "Add", "Adicionar"),
-            scrolls=1,
-            pause=0.08,
-            guard_autostart=False,
-        )
-
-    def _ui_dismiss_autostart_update_dialog(self, serial: str) -> bool:
+    def _ui_dismiss_autostart_update_dialog(
+        self, serial: str, *, xml: str | None = None
+    ) -> bool:
         """Fecha o popup que sobe ao abrir o Autostart.
 
         Foco inicia em «PROCURAR ATUALIZAÇÕES». Regra rígida:
@@ -1376,20 +1320,8 @@ class Adb:
         import time
         import xml.etree.ElementTree as ET
 
-        def _dialog_open(xml: str) -> bool:
-            low = (xml or "").lower()
-            has_procurar = any(
-                t in low
-                for t in (
-                    "procurar atualiza",
-                    "buscar atualiza",
-                    "procurar atualizações",
-                    "buscar atualizações",
-                    "check for update",
-                )
-            )
-            has_ok = bool(re.search(r'(?:text|content-desc)="ok"', low))
-            return has_procurar and has_ok
+        def _dialog_open(blob: str) -> bool:
+            return self._ui_autostart_update_dialog_open(blob)
 
         def _parse_root(xml: str):
             if not (xml or "").strip().startswith("<"):
@@ -1444,184 +1376,158 @@ class Adb:
                     parts.append((node.get("content-desc") or "").lower())
             return " ".join(parts)
 
-        # Popup costuma já estar lá; 2 dumps bastam para decidir
-        xml = self._dump_ui_xml(serial)
+        if xml is None:
+            xml = self._dump_ui_xml(serial) or ""
         if not _dialog_open(xml):
-            time.sleep(0.15)
-            xml = self._dump_ui_xml(serial)
-            if not _dialog_open(xml):
-                return False
+            return False
 
-        for attempt in range(5):
-            xml = self._dump_ui_xml(serial)
+        for attempt in range(3):
+            if attempt > 0:
+                xml = self._dump_ui_xml(serial) or ""
             if not _dialog_open(xml):
                 return True
 
             focus = _focus_blob(xml)
             if any(t in focus for t in ("procurar", "buscar", "atualiza", "update")):
                 self.shell_try(serial, "input keyevent 22", timeout_s=2)
-                time.sleep(0.18)
+                time.sleep(0.12)
                 continue
 
             if re.search(r"(^|\s)ok(\s|$)", focus):
                 self.shell_try(serial, "input keyevent 23", timeout_s=2)
-                time.sleep(0.18)
+                time.sleep(0.12)
                 continue
 
-            if attempt % 2 == 0:
-                self.shell_try(serial, "input keyevent 22", timeout_s=2)
-                time.sleep(0.12)
+            self.shell_try(serial, "input keyevent 22", timeout_s=2)
             pos = _ok_xy(xml)
             if pos is not None:
                 self._tap_only(serial, pos[0], pos[1])
-                time.sleep(0.2)
+                time.sleep(0.12)
 
-        return not _dialog_open(self._dump_ui_xml(serial) or "")
+        return True
 
-    def configure_tts_pt_br_voice_v(self, serial: str) -> str:
-        """Configura Síntese de Voz (pt-BR / Voz V) sem navegar Configurações na tela.
-
-        Equivalente funcional a:
-          motor Google TTS + locale pt-BR + dados de voz pt-BR + Voz V
-
-        Estratégia silenciosa:
-          1) settings secure (motor/idioma) — sem UI
-          2) brilho/animações zerados — procedimento invisível
-          3) intent direto VoiceDataInstallActivity (não percorre menus)
-          4) só na activity do TTS: Português (Brasil) → Voz V
-          5) reaplicar settings, fechar UI e restaurar display
+    def configure_tts_pt_br_voice_v(
+        self,
+        serial: str,
+        *,
+        manage_display: bool = True,
+        on_status: Callable[[str], None] | None = None,
+    ) -> TtsConfigResult:
+        """Configura Síntese de Voz com sequência fixa: 38× baixo + Enter,
+        depois 5× baixo + Enter em Voz V. Sem dump no meio do caminho.
         """
-        import time
+
+        def status(msg: str) -> None:
+            if on_status:
+                on_status(msg)
 
         engine = self._resolve_tts_engine_package(serial)
         if not engine:
-            return (
-                "Pós-config TTS: nenhum motor TTS encontrado após a instalação. "
-                "Confira se o APK de Síntese de Voz instalou (ex.: com.google.android.tts)."
+            return TtsConfigResult(
+                voice_v_confirmed=False,
+                engine_locale_ok=False,
+                message=(
+                    "Pós-config TTS: nenhum motor TTS encontrado após a instalação. "
+                    "Confira se o APK de Síntese de Voz instalou (ex.: com.google.android.tts)."
+                ),
             )
 
         self.set_autostart_apps_enabled(serial, False)
-        display_state = self._tts_hide_display(serial)
+        display_state = self._tts_hide_display(serial) if manage_display else {}
+        if not manage_display:
+            self._tts_prepare_fast_ui(serial)
         done: list[str] = [f"motor={engine}"]
+        voice_ok = False
+        verified = False
 
         try:
             self._tts_apply_engine_locale(serial, engine)
             done.append("locale=pt-BR")
+            status("TTS: motor e locale pt-BR gravados.")
 
-            # Só fecha Settings; não force-stop do TTS antes do instalador
             self.shell_try(
                 serial,
                 "am force-stop com.android.tv.settings; "
                 "am force-stop com.android.settings; "
-                "input keyevent 3",
+                "input keyevent 224",
                 timeout_s=5,
             )
-            time.sleep(0.08)
 
+            status("TTS: abrindo instalador de vozes…")
             if not self._open_tts_voice_data_install(serial, engine):
                 self._tts_apply_engine_locale(serial, engine)
-                return (
-                    "Pós-config TTS parcial: motor/idioma definidos em silêncio, "
-                    "mas o instalador de dados de voz não abriu "
-                    f"({engine}/VoiceDataInstallActivity)."
+                verified = self._tts_verify_engine_locale(serial, engine)
+                return TtsConfigResult(
+                    voice_v_confirmed=False,
+                    engine_locale_ok=verified,
+                    message=(
+                        "Pós-config TTS parcial: motor/idioma definidos, "
+                        "mas o instalador de dados de voz não abriu "
+                        f"({engine}/VoiceDataInstallActivity)."
+                    ),
                 )
             done.append("instalador-voz")
-            time.sleep(0.2)
 
-            # Lista longa: menos dumps, mais DPAD por ciclo
-            pt_ok = self._ui_navigate_long_list(
-                serial,
-                (
-                    "Português (Brasil)",
-                    "Portugues (Brasil)",
-                    "Português - Brasil",
-                    "Portuguese (Brazil)",
-                    "pt-BR",
-                    "Brasil",
-                ),
-                rounds=10,
-                downs_per_round=24,
-                pause=0.04,
-                dump_every=2,
-                hint_substrings=(
-                    "brasil",
-                    "portug",
-                    "portuguese",
-                    "pt-br",
-                    "idioma",
-                    "language",
-                ),
-                guard_autostart=False,
-            )
-            if not pt_ok:
-                self._tts_apply_engine_locale(serial, engine)
-                return (
-                    "Pós-config TTS parcial: motor/idioma OK; "
-                    "não achou Português (Brasil) no instalador de voz."
-                )
-            done.append("pt-BR")
-            time.sleep(0.12)
-
-            # Dispara download/instalar se o botão estiver visível
-            self._ui_navigate_step(
-                serial,
-                (
-                    "Fazer o download do pacote de voz",
-                    "Fazer o download",
-                    "Fazer download",
-                    "Instalar",
-                    "Install",
-                    "Transferir",
-                    "Download",
-                    "Baixar",
-                    "Atualizar",
-                ),
-                scrolls=1,
-                pause=0.08,
-                optional=True,
-                guard_autostart=False,
-            )
-
-            has_net = self._tts_device_has_network(serial)
-            voice_ok = self._tts_wait_and_select_voice_v(
-                serial,
-                max_rounds=14 if has_net else 4,
-            )
+            status("TTS: 38× baixo → português (Brasil) → espera download → 5× → Voz V.")
+            voice_ok, trail = self._tts_navigate_installer(serial, on_status=on_status)
+            done.extend(trail)
             if voice_ok:
                 done.append("Voz V")
-            elif not has_net:
+            elif not self._tts_device_has_network(serial):
                 done.append("sem-rede")
 
             self._tts_apply_engine_locale(serial, engine)
-            # Acorda o serviço depois da seleção (não antes — force-stop matava o wake)
             self._tts_wake_engine_service(serial, engine)
             verified = self._tts_verify_engine_locale(serial, engine)
             if verified:
                 done.append("verificado")
 
-            trail = ", ".join(done)
+            trail_txt = ", ".join(done)
             if voice_ok and verified:
-                return f"Pós-config TTS OK (silenciosa): {trail}."
-            if voice_ok:
-                return (
-                    f"Pós-config TTS OK com ressalva (silenciosa): {trail}. "
+                msg = f"Pós-config TTS OK: {trail_txt}."
+            elif voice_ok:
+                msg = (
+                    f"Pós-config TTS OK com ressalva: {trail_txt}. "
                     "Voz V selecionada; confira o motor padrão se necessário."
                 )
-            if not has_net:
-                return (
-                    f"Pós-config TTS parcial (silenciosa): {trail}. "
-                    "Motor/idioma OK e Português aberto, mas o Mini PC está SEM INTERNET "
-                    "(eth0/wlan0 sem link). Conecte cabo de rede ou Wi‑Fi e rode de novo "
-                    "para baixar a Voz V (~9 MB)."
+            elif "sem-rede" in done:
+                msg = (
+                    f"Pós-config TTS parcial: {trail_txt}. "
+                    "O Mini PC está SEM INTERNET para baixar a Voz V (~9 MB)."
                 )
-            return (
-                f"Pós-config TTS parcial (silenciosa): {trail}. "
-                "Português encontrado, mas Voz V não foi confirmada "
-                "(verifique internet no Mini PC)."
+            else:
+                msg = (
+                    f"Pós-config TTS parcial: {trail_txt}. "
+                    "A Voz V não foi confirmada na tela."
+                )
+            return TtsConfigResult(
+                voice_v_confirmed=voice_ok,
+                engine_locale_ok=verified,
+                message=msg,
             )
         finally:
-            self.close_settings_and_tts_ui(serial)
-            self._tts_restore_display(serial, display_state)
+            self.close_settings_and_tts_ui(serial, stop_tts_engine=False)
+            if manage_display:
+                self._tts_restore_display(serial, display_state)
+
+    def hide_device_screen(self, serial: str) -> dict[str, str]:
+        """Zera brilho/animações para procedimentos de UI no dispositivo."""
+        return self._tts_hide_display(serial)
+
+    def restore_device_screen(self, serial: str, state: dict[str, str]) -> None:
+        self._tts_restore_display(serial, state)
+
+    def _tts_prepare_fast_ui(self, serial: str) -> None:
+        """Zera animações e mantém a tela ligada — sem apagar o HDMI."""
+        self.shell_try(
+            serial,
+            "settings put global window_animation_scale 0; "
+            "settings put global transition_animation_scale 0; "
+            "settings put global animator_duration_scale 0; "
+            "svc power stayon true; "
+            "input keyevent 224",
+            timeout_s=6,
+        )
 
     def _tts_apply_engine_locale(self, serial: str, engine: str) -> None:
         """Define motor e locale pt-BR via Settings Secure (sem UI)."""
@@ -1656,9 +1562,8 @@ class Adb:
         )
 
     def _tts_hide_display(self, serial: str) -> dict[str, str]:
-        """Zera brilho/animações para o procedimento não aparecer na tela."""
+        """Apaga HDMI/framebuffer. Brilho 0 sozinho não esconde tela em Mini PC Allwinner."""
         state: dict[str, str] = {}
-        # Um único shell: lê e aplica (bem mais rápido que N round-trips)
         blob = (
             self.shell_try(
                 serial,
@@ -1672,8 +1577,21 @@ class Adb:
                 "settings put global window_animation_scale 0; "
                 "settings put global transition_animation_scale 0; "
                 "settings put global animator_duration_scale 0; "
-                "svc power stayon true",
-                timeout_s=6,
+                "svc power stayon true; "
+                "for f in /sys/class/graphics/fb0/blank /sys/class/graphics/fb1/blank "
+                "/sys/devices/virtual/graphics/fb0/blank; do "
+                "  if [ -e \"$f\" ]; then echo FB|$f|$(cat \"$f\" 2>/dev/null); "
+                "  echo 1 > \"$f\" 2>/dev/null; fi; "
+                "done; "
+                "for f in /sys/class/backlight/*/brightness; do "
+                "  if [ -e \"$f\" ]; then echo BL|$f|$(cat \"$f\" 2>/dev/null); "
+                "  echo 0 > \"$f\" 2>/dev/null; fi; "
+                "done; "
+                "if [ -e /sys/class/disp/disp/attr/blank ]; then "
+                "  echo DISP|$(cat /sys/class/disp/disp/attr/blank 2>/dev/null); "
+                "  echo 1 > /sys/class/disp/disp/attr/blank 2>/dev/null; "
+                "fi",
+                timeout_s=8,
             )
             or ""
         )
@@ -1689,44 +1607,118 @@ class Adb:
                 state["global:transition_animation_scale"] = line.split("=", 1)[-1].strip()
             elif line.startswith("AA="):
                 state["global:animator_duration_scale"] = line.split("=", 1)[-1].strip()
+            elif line.startswith("FB|"):
+                _, path, val = (line.split("|", 2) + ["", ""])[:3]
+                if path:
+                    state[f"fb:{path}"] = val
+            elif line.startswith("BL|"):
+                _, path, val = (line.split("|", 2) + ["", ""])[:3]
+                if path:
+                    state[f"bl:{path}"] = val
+            elif line.startswith("DISP|"):
+                state["disp_blank"] = line.split("|", 1)[-1].strip()
+        self._display_blanked = True
         return state
 
     def _tts_restore_display(self, serial: str, state: dict[str, str]) -> None:
-        """Restaura brilho/animações salvos antes da config silenciosa."""
+        """Restaura brilho/HDMI após a sessão silenciosa."""
+        self._display_blanked = False
         parts = ["svc power stayon false"]
-        if not state:
+        settings_keys = (
+            "system:screen_brightness",
+            "system:screen_brightness_mode",
+            "global:window_animation_scale",
+            "global:transition_animation_scale",
+            "global:animator_duration_scale",
+        )
+        restored_settings = False
+        for compound in settings_keys:
+            val = (state or {}).get(compound, "")
+            if not val or val.lower() == "null":
+                continue
+            if ":" not in compound:
+                continue
+            ns, key = compound.split(":", 1)
+            parts.append(f"settings put {ns} {key} {val}")
+            restored_settings = True
+        if not restored_settings:
             parts.append("settings put system screen_brightness 128")
-        else:
-            for compound, val in state.items():
-                if ":" not in compound or not val or val.lower() == "null":
-                    continue
-                ns, key = compound.split(":", 1)
-                parts.append(f"settings put {ns} {key} {val}")
-        self.shell_try(serial, "; ".join(parts), timeout_s=6)
+        for key, val in (state or {}).items():
+            if key.startswith("fb:") and val:
+                path = key[3:]
+                parts.append(f"echo {val} > {path} 2>/dev/null")
+            elif key.startswith("bl:") and val:
+                path = key[3:]
+                parts.append(f"echo {val} > {path} 2>/dev/null")
+            elif key == "disp_blank" and val:
+                parts.append(
+                    f"echo {val} > /sys/class/disp/disp/attr/blank 2>/dev/null"
+                )
+        # Se não salvamos fb, tenta desblankar mesmo assim
+        if not any(k.startswith("fb:") for k in (state or {})):
+            parts.append("echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null")
+            parts.append("echo 0 > /sys/class/disp/disp/attr/blank 2>/dev/null")
+        self.shell_try(serial, "; ".join(parts), timeout_s=8)
+
+    def _reapply_display_blank(self, serial: str) -> None:
+        """uiautomator dump costuma acordar o HDMI — reaplica o blank."""
+        if not self._display_blanked:
+            return
+        self.shell_try(
+            serial,
+            "echo 1 > /sys/class/graphics/fb0/blank 2>/dev/null; "
+            "echo 1 > /sys/class/graphics/fb1/blank 2>/dev/null; "
+            "echo 1 > /sys/class/disp/disp/attr/blank 2>/dev/null; "
+            "for f in /sys/class/backlight/*/brightness; do "
+            "  echo 0 > \"$f\" 2>/dev/null; done; "
+            "settings put system screen_brightness 0",
+            timeout_s=3,
+        )
 
     def _open_tts_voice_data_install(self, serial: str, engine: str) -> bool:
-        """Abre direto o instalador de dados de voz do motor (sem menus Settings)."""
-        import time
-
+        """Abre o instalador na lista padrão (sem extras — a contagem 38 depende disso)."""
+        self.shell_try(serial, f"am force-stop {engine}", timeout_s=4)
+        time.sleep(0.25)
         cmds = (
             f"am start -a android.speech.tts.engine.INSTALL_TTS_DATA "
             f"-n {engine}/.local.voicepack.ui.VoiceDataInstallActivity",
-            f"am start -a android.speech.tts.engine.INSTALL_TTS_DATA -p {engine}",
             f"am start -n {engine}/.local.voicepack.ui.VoiceDataInstallActivity",
-            f"am start -a {engine}.settings.EngineSettings "
-            f"-n {engine}/.settings.EngineSettings",
         )
+        started = False
         for cmd in cmds:
             try:
                 out = self.shell_combined(serial, cmd, timeout_s=8)
             except AdbError:
                 continue
-            if self._am_start_succeeded(out) or "starting:" in (out or "").lower():
+            low = (out or "").lower()
+            if self._am_start_succeeded(out) or "starting:" in low:
+                started = True
+                break
+        if not started:
+            return False
+        self._tts_wait_installer_focused(serial, engine)
+        return True
+
+    def _tts_wait_installer_focused(
+        self, serial: str, engine: str, *, timeout_s: float = 2.5
+    ) -> None:
+        """Espera a lista ganhar foco antes dos 38 cliques (senão as teclas se perdem)."""
+        deadline = time.monotonic() + timeout_s
+        needle = (engine or "").lower()
+        while time.monotonic() < deadline:
+            line = (
+                self.shell_try(
+                    serial,
+                    "dumpsys window 2>/dev/null | grep -m 1 -E 'mCurrentFocus|mFocusedApp'",
+                    timeout_s=2,
+                )
+                or ""
+            ).lower()
+            if "voicedatainstall" in line or (needle and needle in line):
                 time.sleep(0.2)
-                # Intent iniciou: não espera dump completo (lista pode ainda carregar)
-                if "error" not in (out or "").lower() and "exception" not in (out or "").lower():
-                    return True
-        return False
+                return
+            time.sleep(0.1)
+        time.sleep(0.25)
 
     def _tts_device_has_network(self, serial: str) -> bool:
         """True se o Mini PC tem rota/default network (necessário p/ baixar voz)."""
@@ -1749,59 +1741,656 @@ class Adb:
                 return True
         return False
 
-    def _tts_wait_and_select_voice_v(self, serial: str, *, max_rounds: int = 14) -> bool:
-        """Aguarda download (se houver) e seleciona Voz V."""
-        import time
+    _TTS_PORTUGUESE_BRAZIL_LABELS: tuple[str, ...] = (
+        "português (Brasil)",
+        "Português (Brasil)",
+        "Portuguese (Brazil)",
+        "Português - Brasil",
+        "Portugues (Brasil)",
+    )
+    _TTS_COUNTRY_LABELS: tuple[str, ...] = ("Brasil", "Brazil")
+    _TTS_VOICE_LABELS: tuple[str, ...] = ("Voz V", "voz V", "Voice V")
+    _TTS_DOWNLOAD_LABELS: tuple[str, ...] = (
+        "Fazer o download do pacote de voz",
+        "Fazer o download",
+        "Fazer download",
+        "Download",
+        "Baixar",
+    )
+    _TTS_SEARCH_LABELS: tuple[str, ...] = (
+        "Pesquisar",
+        "Search",
+        "Buscar",
+        "Procurar",
+        "Filtro",
+        "Filter",
+    )
 
-        self._ui_tap_label_anywhere(
+    TTS_PT_BR_DOWN_COUNT = 38
+    TTS_VOICE_V_DOWN_COUNT = 5
+    TTS_PT_BR_DOWNLOAD_WAIT_S = 10
+
+    @staticmethod
+    def _tts_keyevent_cmd(downs: int, *, enter: bool = False) -> str:
+        n = max(0, int(downs))
+        codes = ["20"] * n
+        if enter:
+            codes.append("23")
+        return "input keyevent " + " ".join(codes)
+
+    def _tts_dpad_down(self, serial: str, downs: int) -> None:
+        """Só os cliques para baixo, num único input (rápido, contagem exata)."""
+        self.shell_try(
             serial,
-            (
-                "Fazer o download do pacote de voz",
-                "Fazer o download",
-                "Fazer download",
-                "Download",
-                "Baixar",
-            ),
-            prefer_left=False,
+            self._tts_keyevent_cmd(downs, enter=False),
+            timeout_s=8,
         )
 
-        for _ in range(max(1, max_rounds)):
+    def _tts_press_enter(self, serial: str) -> None:
+        """Enter depois que o destaque parou no item (CENTER sozinho no burst não abre)."""
+        time.sleep(0.22)
+        # ENTER (66) + OK/CENTER (23): o Mini PC costuma honrar só um dos dois
+        self.shell_try(serial, "input keyevent 66", timeout_s=2)
+        time.sleep(0.07)
+        self.shell_try(serial, "input keyevent 23", timeout_s=2)
+        time.sleep(0.12)
+
+    def _tts_navigate_installer(
+        self,
+        serial: str,
+        *,
+        on_status: Callable[[str], None] | None = None,
+    ) -> tuple[bool, list[str]]:
+        """38× baixo, Enter em português (Brasil); espera o download; 5× baixo, Enter em Voz V."""
+
+        def status(msg: str) -> None:
+            if on_status:
+                on_status(msg)
+
+        trail: list[str] = []
+        status("TTS: 38× baixo até português (Brasil)…")
+        self._tts_dpad_down(serial, self.TTS_PT_BR_DOWN_COUNT)
+        trail.append("38-down")
+        status("TTS: Enter em português (Brasil).")
+        self._tts_press_enter(serial)
+        trail.append("enter-pt-BR")
+        status(
+            f"TTS: aguardando download de português (Brasil) "
+            f"({self.TTS_PT_BR_DOWNLOAD_WAIT_S}s)…"
+        )
+        time.sleep(self.TTS_PT_BR_DOWNLOAD_WAIT_S)
+        trail.append(f"wait-{self.TTS_PT_BR_DOWNLOAD_WAIT_S}s")
+
+        status("TTS: 5× baixo até Voz V…")
+        self._tts_dpad_down(serial, self.TTS_VOICE_V_DOWN_COUNT)
+        trail.append("5-down")
+        status("TTS: Enter em Voz V.")
+        self._tts_press_enter(serial)
+        trail.append("enter-voz-v")
+        time.sleep(0.35)
+
+        xml = self._dump_ui_xml(serial) or ""
+        if self.xml_voice_v_selected(xml) or self._tts_find_voice_v_center(xml):
+            status("TTS: Voz V marcada.")
+            return True, trail + ["voz-v-ok"]
+        if not (xml or "").strip():
+            status("TTS: sequência 38+Enter+5+Enter concluída.")
+            return True, trail + ["sem-dump"]
+        if self._tts_classify_screen(xml) == "voices":
+            status("TTS: tela de vozes após Enter.")
+            return True, trail + ["tela-vozes"]
+        status("TTS: sequência enviada, mas a tela não mostrou Voz V.")
+        return False, trail
+
+    @staticmethod
+    def _tts_screen_label(screen: str) -> str:
+        return {
+            "language": "idiomas",
+            "country": "país",
+            "voices": "vozes",
+            "download": "download",
+            "busy": "baixando",
+            "unknown": "indefinida",
+        }.get(screen, screen)
+
+    @staticmethod
+    def _tts_classify_screen(xml: str) -> str:
+        """Classifica a tela do instalador Google TTS."""
+        if Adb.xml_tts_busy(xml):
+            return "busy"
+        if Adb.xml_has_voice_list(xml) or Adb.xml_voice_v_selected(xml):
+            return "voices"
+        if Adb.xml_is_country_picker(xml):
+            return "country"
+        low = (xml or "").lower()
+        if any(
+            k in low
+            for k in (
+                "fazer o download",
+                "download do pacote",
+                "instalar dados de voz",
+            )
+        ) and "voz v" not in low:
+            return "download"
+        if Adb.xml_has_language_list(xml):
+            return "language"
+        if any(k in low for k in ("portug", "idioma", "language", "english", "espa")):
+            return "language"
+        if Adb._tts_is_portuguese_brazil(low):
+            return "language"
+        return "unknown"
+
+    def _tts_click_labels(
+        self, serial: str, xml: str, labels: tuple[str, ...]
+    ) -> bool:
+        return self._ui_activate_labels_in_xml(
+            serial, xml, labels, tap_only=True
+        )
+
+    def _tts_click_portuguese_brazil(self, serial: str, xml: str) -> bool:
+        """Toca só «português (Brasil)» — nunca Portugal nem o idioma sozinho."""
+        pos = self._tts_find_pt_br_center(xml)
+        if pos is None:
+            return False
+        return self._tap_only(serial, pos[0], pos[1])
+
+    @staticmethod
+    def _tts_is_voice_v_label(text: str) -> bool:
+        t = (text or "").strip()
+        if t == "Voz V":
+            return True
+        return Adb._fold_ui_text(t) == "voz v"
+
+    @staticmethod
+    def _tts_find_voice_v_center(xml: str) -> tuple[int, int] | None:
+        """Centro do item exatamente «Voz V» (texto ou linha clicável)."""
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return None
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return None
+        parent = {child: node for node in root.iter() for child in list(node)}
+        screen_w, screen_h = Adb._hierarchy_size(xml)
+        hits: list[tuple[int, int, int]] = []
+
+        def _usable_center(node: object) -> tuple[int, int, int] | None:
+            if node is None or not hasattr(node, "get"):
+                return None
+            center = Adb._bounds_center(node.get("bounds") or "")
+            if center is None:
+                return None
+            m = re.match(
+                r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", (node.get("bounds") or "").strip()
+            )
+            if not m:
+                return None
+            x1, y1, x2, y2 = map(int, m.groups())
+            w, h = x2 - x1, y2 - y1
+            if Adb._node_is_full_screen(w, h, screen_w, screen_h):
+                return None
+            return w * h, center[0], center[1]
+
+        for node in root.iter("node"):
+            own = (node.get("text") or "").strip()
+            desc = (node.get("content-desc") or "").strip()
+            if not (
+                Adb._tts_is_voice_v_label(own) or Adb._tts_is_voice_v_label(desc)
+            ):
+                continue
+            target = node
+            cur = parent.get(node)
+            for _ in range(4):
+                if cur is None:
+                    break
+                if cur.get("clickable") == "true" or cur.get("checkable") == "true":
+                    cand = _usable_center(cur)
+                    if cand is not None:
+                        target = cur
+                        break
+                cur = parent.get(cur)
+            hit = _usable_center(target)
+            if hit is None:
+                hit = _usable_center(node)
+            if hit is not None:
+                hits.append(hit)
+        if not hits:
+            return None
+        hits.sort(key=lambda t: t[0])
+        _, x, y = hits[0]
+        return x, y
+
+    def _tts_click_voice_v(self, serial: str, xml: str) -> bool:
+        pos = self._tts_find_voice_v_center(xml)
+        if pos is None:
+            return False
+        return self._tap_only(serial, pos[0], pos[1])
+
+    def _tts_wait_for_voice_v_screen(self, serial: str, *, timeout_s: float = 6.0) -> str:
+        """Depois de português (Brasil), espera a tela onde aparece «Voz V»."""
+        deadline = time.monotonic() + max(1.0, timeout_s)
+        last = ""
+        while time.monotonic() < deadline:
             xml = self._dump_ui_xml(serial) or ""
-            low = xml.lower()
-            if self._ui_activate_labels_in_xml(
-                serial, xml, ("Voz V", "voz V", "Voice V")
-            ):
+            if xml:
+                last = xml
+            if self.xml_voice_v_selected(xml) or self._tts_find_voice_v_center(xml):
+                return xml
+            time.sleep(0.18)
+        return last
+
+    def _tts_select_voice_v_now(
+        self,
+        serial: str,
+        xml: str,
+        status: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Toca exatamente «Voz V» e confirma na UI."""
+
+        def note(msg: str) -> None:
+            if status:
+                status(msg)
+
+        current = xml or ""
+        if self.xml_voice_v_selected(current):
+            note("TTS: Voz V já marcada.")
+            return True
+        for _ in range(3):
+            if self.xml_tts_busy(current):
+                current = self._wait_ui_change(serial, current, timeout_s=3.0) or current
+                if self.xml_voice_v_selected(current):
+                    note("TTS: Voz V marcada.")
+                    return True
+                continue
+            if not self._tts_click_voice_v(serial, current):
+                break
+            note("TTS: toquei «Voz V».")
+            current = self._wait_ui_change(serial, current, timeout_s=2.2) or (
+                self._dump_ui_xml(serial) or current
+            )
+            if self.xml_voice_v_selected(current):
+                note("TTS: Voz V marcada.")
                 return True
-            # "V" exato no mesmo dump (evita segundo uiautomator dump)
-            if re.search(r'text="V"', xml) and self._ui_activate_labels_in_xml(
-                serial, xml, ("V",), exact_only=True
-            ):
+        return self.xml_voice_v_selected(self._dump_ui_xml(serial) or current)
+
+    @staticmethod
+    def _fold_ui_text(text: str) -> str:
+        nfkd = unicodedata.normalize("NFKD", text or "")
+        stripped = "".join(c for c in nfkd if not unicodedata.combining(c))
+        return " ".join(stripped.casefold().split())
+
+    @staticmethod
+    def _tts_is_portuguese_brazil(text: str) -> bool:
+        folded = Adb._fold_ui_text(text)
+        if "portugal" in folded:
+            return False
+        has_pt = "portugues" in folded or "portuguese" in folded
+        has_br = "brasil" in folded or "brazil" in folded
+        return has_pt and has_br
+
+    @staticmethod
+    def _tts_node_blob(node: object) -> str:
+        parts: list[str] = []
+
+        def walk(n: object, depth: int) -> None:
+            if n is None or not hasattr(n, "get"):
+                return
+            for attr in ("text", "content-desc"):
+                val = (n.get(attr) or "").strip()
+                if val:
+                    parts.append(val)
+            if depth >= 3:
+                return
+            for child in list(n):
+                walk(child, depth + 1)
+
+        walk(node, 0)
+        return " ".join(parts)
+
+    @staticmethod
+    def _tts_find_pt_br_center(xml: str) -> tuple[int, int] | None:
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return None
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return None
+        screen_w, screen_h = Adb._hierarchy_size(xml)
+        hits: list[tuple[int, int, int]] = []
+        for node in root.iter("node"):
+            blob = Adb._tts_node_blob(node)
+            if not Adb._tts_is_portuguese_brazil(blob):
+                continue
+            center = Adb._bounds_center(node.get("bounds") or "")
+            if center is None:
+                continue
+            m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", (node.get("bounds") or "").strip())
+            if not m:
+                continue
+            x1, y1, x2, y2 = map(int, m.groups())
+            w, h = x2 - x1, y2 - y1
+            if Adb._node_is_full_screen(w, h, screen_w, screen_h):
+                continue
+            hits.append((w * h, center[0], center[1]))
+        if not hits:
+            return None
+        hits.sort(key=lambda t: t[0])
+        _, x, y = hits[0]
+        return x, y
+
+    def _tts_jump_to_portuguese_brazil(self, serial: str, xml: str = "") -> None:
+        """Vai direto a «português (Brasil)» via busca visível ou type-ahead P-O-R."""
+        if xml and (
+            self._tts_click_labels(serial, xml, self._TTS_SEARCH_LABELS)
+            or self._tts_tap_edit_text(serial, xml)
+            or self._tts_tap_search_icon(serial, xml)
+        ):
+            time.sleep(0.15)
+            self.shell_try(serial, "input text Brasil", timeout_s=4)
+            time.sleep(0.3)
+            return
+        self.shell_try(
+            serial,
+            "input keyevent 44; input keyevent 43; input keyevent 46",
+            timeout_s=3,
+        )
+        time.sleep(0.2)
+
+    def _tts_tap_search_icon(self, serial: str, xml: str) -> bool:
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return False
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return False
+        for node in root.iter("node"):
+            rid = (node.get("resource-id") or "").lower()
+            desc = (node.get("content-desc") or "").lower()
+            cls = (node.get("class") or "").lower()
+            blob = f"{rid} {desc} {cls}"
+            if not any(k in blob for k in ("search", "pesquis", "buscar", "filter", "filtro")):
+                continue
+            center = self._bounds_center(node.get("bounds") or "")
+            if center is None:
+                continue
+            return self._tap_only(serial, center[0], center[1])
+        return False
+
+    def _tts_swipe_list(self, serial: str, xml: str) -> None:
+        w, h = self._hierarchy_size(xml)
+        if w < 80 or h < 80:
+            w, h = 1920, 1080
+        x = max(40, w // 2)
+        y1 = max(80, int(h * 0.78))
+        y2 = max(40, int(h * 0.28))
+        self.shell_try(serial, f"input swipe {x} {y1} {x} {y2} 160", timeout_s=3)
+
+    def _tts_scroll(self, serial: str, *, downs: int = 6) -> None:
+        n = max(1, min(12, int(downs)))
+        cmd = "; ".join(["input keyevent 20"] * n)
+        self.shell_try(serial, cmd, timeout_s=3)
+
+    def _tts_try_search(self, serial: str, xml: str, query: str) -> bool:
+        """Toca o campo de busca (se existir) e digita ASCII para pular a lista."""
+        if not self._tts_click_labels(serial, xml, self._TTS_SEARCH_LABELS):
+            if not self._tts_tap_edit_text(serial, xml):
+                if not self._tts_tap_search_icon(serial, xml):
+                    return False
+        time.sleep(0.25)
+        q = re.sub(r"[^A-Za-z0-9]", "", query)
+        if not q:
+            return False
+        typed = self.shell_try(serial, f"input text {q}", timeout_s=4)
+        if typed is None:
+            return False
+        time.sleep(0.35)
+        return True
+
+    def _tts_tap_edit_text(self, serial: str, xml: str) -> bool:
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return False
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return False
+        for node in root.iter("node"):
+            cls = (node.get("class") or "").lower()
+            rid = (node.get("resource-id") or "").lower()
+            if "edittext" not in cls and "search" not in rid and "query" not in rid:
+                continue
+            center = self._bounds_center(node.get("bounds") or "")
+            if center is None:
+                continue
+            return self._tap_only(serial, center[0], center[1])
+        return False
+
+    def _wait_ui_change(self, serial: str, prev_xml: str, *, timeout_s: float = 2.5) -> str:
+        prev = self._xml_signature(prev_xml)
+        deadline = time.monotonic() + max(0.6, timeout_s)
+        last = prev_xml
+        while time.monotonic() < deadline:
+            time.sleep(0.18)
+            xml = self._dump_ui_xml(serial) or ""
+            if xml and self._xml_signature(xml) != prev:
+                return xml
+            if xml:
+                last = xml
+        return last
+
+    @staticmethod
+    def _xml_signature(xml: str) -> str:
+        texts = re.findall(r'(?:text|content-desc)="([^"]*)"', xml or "")
+        return "|".join(t for t in texts if t)[:900]
+
+    def _tts_wait_and_select_voice_v(
+        self,
+        serial: str,
+        *,
+        engine: str = "",
+        max_rounds: int = 8,
+    ) -> bool:
+        _ = engine, max_rounds
+        ok, _trail = self._tts_navigate_installer(serial)
+        return ok
+
+    def _tts_pick_portuguese_brazil(self, serial: str) -> bool:
+        ok, trail = self._tts_navigate_installer(serial)
+        return ok or any(s in {"country", "voices", "voz-v-ok"} for s in trail)
+
+    def _tts_wait_voice_installer_ready(
+        self, serial: str, engine: str, *, timeout_s: float = 8.0
+    ) -> bool:
+        """Espera a lista do instalador de voz aparecer de verdade."""
+        _ = engine
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            xml = self._dump_ui_xml(serial) or ""
+            screen = self._tts_classify_screen(xml)
+            if screen in {"language", "country", "voices", "download"}:
                 return True
-            if "voz v" in low or re.search(r"\bvoice\s*v\b", low):
-                time.sleep(0.15)
-                continue
-            if "fazer o download" in low or "download do pacote" in low:
-                self._ui_activate_labels_in_xml(
-                    serial,
-                    xml,
-                    (
-                        "Fazer o download do pacote de voz",
-                        "Fazer o download",
-                        "Fazer download",
-                    ),
-                )
-                time.sleep(0.7)
-                continue
-            if any(k in low for k in ("baixando", "instalando", "loading", "%", "aguarde")):
-                time.sleep(0.7)
-                continue
-            # Poucos scrolls rápidos atrás da Voz V
+            if engine and self._package_is_focused(serial, engine) and xml.strip().startswith("<"):
+                return True
+            time.sleep(0.2)
+        return False
+
+    def _current_focus_line(self, serial: str) -> str:
+        return (
             self.shell_try(
                 serial,
-                "input keyevent 20; input keyevent 20; input keyevent 20; input keyevent 20",
-                timeout_s=2,
+                "dumpsys window 2>/dev/null | grep -m 1 -E 'mCurrentFocus|mFocusedApp'",
+                timeout_s=4,
             )
-            time.sleep(0.2)
+            or ""
+        ).strip()
+
+    @staticmethod
+    def parse_focus_package(line: str) -> str:
+        """Extrai o package de uma linha mCurrentFocus/mFocusedApp."""
+        m = re.search(r"\s([a-zA-Z0-9_.]+)/[a-zA-Z0-9_.$]+", line or "")
+        return m.group(1) if m else ""
+
+    def _focused_package(self, serial: str) -> str:
+        return self.parse_focus_package(self._current_focus_line(serial))
+
+    def _package_is_focused(self, serial: str, package: str) -> bool:
+        pkg = (package or "").strip()
+        if not pkg:
+            return False
+        focused = self._focused_package(serial)
+        if focused:
+            return focused == pkg or focused.startswith(pkg)
+        act = self._resumed_activity(serial)
+        if not act.strip():
+            return True
+        return pkg.lower() in act.lower()
+
+    def _autostart_is_focused(self, serial: str) -> bool:
+        focused = self._focused_package(serial).lower()
+        if not focused:
+            return False
+        return any("autostart" in part for part in focused.split("."))
+
+    def _resumed_activity(self, serial: str) -> str:
+        return (
+            self.shell_try(
+                serial,
+                "dumpsys activity activities 2>/dev/null | "
+                "grep -m 1 -E 'mResumedActivity|mFocusedActivity|topResumedActivity'",
+                timeout_s=4,
+            )
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _activity_is_tts_installer(activity: str, engine: str = "") -> bool:
+        low = (activity or "").lower()
+        if any(
+            k in low
+            for k in (
+                "voicedatainstall",
+                "enginesettings",
+                "tts.engine",
+                "voicepack",
+            )
+        ):
+            return True
+        eng = (engine or "").lower()
+        return bool(eng) and eng in low
+
+    @staticmethod
+    def xml_has_language_list(xml: str) -> bool:
+        """True se o dump parece lista de idiomas (não a lista de países)."""
+        low = (xml or "").lower()
+        keys = (
+            "english",
+            "inglês",
+            "ingles",
+            "español",
+            "espanhol",
+            "français",
+            "frances",
+            "deutsch",
+            "italiano",
+            "portug",
+        )
+        return sum(1 for k in keys if k in low) >= 2
+
+    @staticmethod
+    def xml_is_country_picker(xml: str) -> bool:
+        low = (xml or "").lower()
+        if Adb.xml_has_voice_list(xml):
+            return False
+        has_br = "brasil" in low or "brazil" in low
+        has_pt = "portugal" in low
+        explicit = any(k in low for k in ("país", "pais", "country", "região", "region"))
+        if explicit and has_br:
+            return not Adb.xml_has_language_list(xml)
+        if has_br and has_pt:
+            # "Português (Brasil)" + "Português (Portugal)" na lista de idiomas
+            return not Adb.xml_has_language_list(xml)
+        return False
+
+    @staticmethod
+    def xml_has_voice_list(xml: str) -> bool:
+        low = (xml or "").lower()
+        return any(
+            k in low
+            for k in ("voz v", "voice v", "voz x", "voice x")
+        )
+
+    @staticmethod
+    def xml_tts_busy(xml: str) -> bool:
+        low = (xml or "").lower()
+        return any(
+            k in low
+            for k in (
+                "baixando",
+                "instalando",
+                "loading",
+                "aguarde",
+                "downloading",
+                "installing",
+            )
+        )
+
+    @staticmethod
+    def xml_voice_v_selected(xml: str) -> bool:
+        """True se o dump da UI mostra Voz V marcada/selecionada."""
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return False
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return False
+
+        parent = {child: node for node in root.iter() for child in list(node)}
+
+        def _is_voice_label(text: str) -> bool:
+            return Adb._tts_is_voice_v_label(text)
+
+        def _marked(n: object) -> bool:
+            if n is None or not hasattr(n, "get"):
+                return False
+            return n.get("checked") == "true" or n.get("selected") == "true"
+
+        for node in root.iter("node"):
+            blob = " ".join(
+                x
+                for x in (
+                    node.get("text") or "",
+                    node.get("content-desc") or "",
+                )
+                if x
+            )
+            if not _is_voice_label(blob):
+                continue
+            cur: object | None = node
+            for _ in range(5):
+                if cur is None:
+                    break
+                if _marked(cur):
+                    return True
+                par = parent.get(cur)
+                if par is not None:
+                    for sib in list(par):
+                        if _marked(sib):
+                            return True
+                cur = par
         return False
 
     def _resolve_tts_engine_package(self, serial: str) -> str | None:
@@ -1829,6 +2418,7 @@ class Adb:
         pause: float = 0.05,
         optional: bool = False,
         guard_autostart: bool = False,
+        tap_only: bool = False,
     ) -> bool:
         """Seleciona um item na UI; 1 dump por tentativa."""
         import time
@@ -1838,13 +2428,15 @@ class Adb:
             if guard_autostart:
                 self._ensure_autostart_dead(serial)
             xml = self._dump_ui_xml(serial)
-            if self._ui_activate_labels_in_xml(serial, xml, labels):
+            if self._ui_activate_labels_in_xml(
+                serial, xml, labels, tap_only=tap_only
+            ):
                 time.sleep(pause)
                 return True
             if attempt < scrolls:
                 self.shell_try(
                     serial,
-                    "input keyevent 20; input keyevent 20; input keyevent 20; input keyevent 20",
+                    "input keyevent 20; input keyevent 20",
                     timeout_s=2,
                 )
                 time.sleep(0.02)
@@ -1861,6 +2453,8 @@ class Adb:
         dump_every: int = 1,
         hint_substrings: tuple[str, ...] = (),
         guard_autostart: bool = False,
+        tap_only: bool = False,
+        stay_in_package: str = "",
     ) -> bool:
         """Lista longa: muitos DPAD por dump (dump_every>1 reduz dumps)."""
         import time
@@ -1868,6 +2462,15 @@ class Adb:
         downs_cmd = "; ".join(["input keyevent 20"] * max(1, downs_per_round))
         every = max(1, dump_every)
         for i in range(max(1, rounds)):
+            if stay_in_package:
+                focused = self._focused_package(serial)
+                if (
+                    focused
+                    and focused != stay_in_package
+                    and not focused.startswith(stay_in_package)
+                ):
+                    self._open_tts_voice_data_install(serial, stay_in_package)
+                    continue
             if guard_autostart:
                 self._ensure_autostart_dead(serial)
             if i % every == 0:
@@ -1876,24 +2479,34 @@ class Adb:
                 if not (
                     hint_substrings and not any(h in low for h in hint_substrings)
                 ):
-                    if self._ui_activate_labels_in_xml(serial, xml, labels):
+                    if self._ui_activate_labels_in_xml(
+                        serial, xml, labels, tap_only=tap_only
+                    ):
                         time.sleep(pause)
                         return True
             self.shell_try(serial, downs_cmd, timeout_s=2)
-            time.sleep(0.02)
+            time.sleep(0.0)
         xml = self._dump_ui_xml(serial)
-        return self._ui_activate_labels_in_xml(serial, xml, labels)
+        return self._ui_activate_labels_in_xml(
+            serial, xml, labels, tap_only=tap_only
+        )
 
     def _dump_ui_xml(self, serial: str) -> str:
-        """Dump da UI (timeout enxuto para agilizar navegação)."""
-        out = self.shell_try(
-            serial,
-            "uiautomator dump /sdcard/aibox_ui.xml >/dev/null 2>&1; cat /sdcard/aibox_ui.xml",
-            timeout_s=5,
-        ) or ""
-        if "<" in out:
-            return out[out.index("<") :]
-        return out
+        """Dump da UI sem reutilizar XML velho (timeout folgado no Mini PC)."""
+        cmds = (
+            "rm -f /sdcard/aibox_ui.xml; "
+            "uiautomator dump --compressed /sdcard/aibox_ui.xml >/dev/null 2>&1; "
+            "cat /sdcard/aibox_ui.xml",
+            "rm -f /sdcard/aibox_ui.xml; "
+            "uiautomator dump /sdcard/aibox_ui.xml >/dev/null 2>&1; "
+            "cat /sdcard/aibox_ui.xml",
+        )
+        for i in range(3):
+            out = self.shell_try(serial, cmds[0 if i == 0 else 1], timeout_s=10) or ""
+            if "<hierarchy" in out or (out.strip().startswith("<") and "node" in out):
+                return out[out.index("<") :]
+            time.sleep(0.15)
+        return ""
 
     def _ui_select_voice_v(self, serial: str) -> bool:
         """Seleciona item de voz rotulado como V / Voz V."""
@@ -1909,6 +2522,7 @@ class Adb:
         labels: tuple[str, ...],
         *,
         exact_only: bool = False,
+        tap_only: bool = False,
     ) -> bool:
         """Usa um dump já obtido: encontra rótulo e toca (exact + fuzzy numa passada)."""
         import xml.etree.ElementTree as ET
@@ -1921,7 +2535,8 @@ class Adb:
             return False
 
         wanted = tuple(x.strip().lower() for x in labels if x.strip())
-        candidates: list[tuple[int, int, int]] = []
+        screen_w, screen_h = self._hierarchy_size(xml)
+        candidates: list[tuple[int, int, int, bool]] = []
 
         for node in root.iter("node"):
             texts: list[str] = []
@@ -1945,6 +2560,15 @@ class Adb:
                         score = max(score, 1000 - i * 10)
                     elif not exact_only and (lab in tl or tl in lab):
                         score = max(score, 400 - i * 10 - abs(len(tl) - len(lab)))
+            blob = self._fold_ui_text(" ".join(texts))
+            for i, lab in enumerate(wanted):
+                lf = self._fold_ui_text(lab)
+                if not lf:
+                    continue
+                if blob == lf:
+                    score = max(score, 1100 - i * 10)
+                elif not exact_only and lf in blob:
+                    score = max(score, 500 - i * 10)
             if score < 0:
                 continue
             center = self._bounds_center(node.get("bounds") or "")
@@ -1954,17 +2578,23 @@ class Adb:
             if m:
                 x1, y1, x2, y2 = map(int, m.groups())
                 w, h = x2 - x1, y2 - y1
-                if w > 1600 or h > 360:
+                # Linha 1920px de lista HDMI é válida; só ignora o container da tela toda
+                if self._node_is_full_screen(w, h, screen_w, screen_h):
                     continue
                 if h < 120:
                     score += 15
             x, y = center
-            candidates.append((score, x, y))
+            focused = node.get("focused") == "true" or node.get("selected") == "true"
+            candidates.append((score, x, y, focused))
 
         if not candidates:
             return False
         candidates.sort(key=lambda t: t[0], reverse=True)
-        _, x, y = candidates[0]
+        _, x, y, focused = candidates[0]
+        if focused:
+            return self.shell_try(serial, "input keyevent 23", timeout_s=2) is not None
+        if tap_only:
+            return self._tap_only(serial, x, y)
         return self._tap_and_confirm(serial, x, y)
 
     def _ui_select_exact_text(self, serial: str, text: str) -> bool:
@@ -1996,7 +2626,8 @@ class Adb:
             m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", (node.get("bounds") or "").strip())
             if m:
                 x1, y1, x2, y2 = map(int, m.groups())
-                if (x2 - x1) > 1200 or (y2 - y1) > 200:
+                w, h = x2 - x1, y2 - y1
+                if self._node_is_full_screen(w, h):
                     continue
             x, y = center
             self._tap_and_confirm(serial, x, y)
@@ -2847,7 +3478,7 @@ class Adb:
                 continue
             x1, y1, x2, y2 = map(int, m.groups())
             w, h = x2 - x1, y2 - y1
-            if w > 1600 or h > 400:
+            if Adb._node_is_full_screen(w, h):
                 continue
             rid = (node.get("resource-id") or "").lower()
             exact = any(t.lower() in confirm_l for t in texts)
@@ -2867,6 +3498,23 @@ class Adb:
         _, y, x, _ = candidates[0]
         self.shell_lax(serial, f"input tap {x} {y}", timeout_s=3)
         return True
+
+    @staticmethod
+    def _hierarchy_size(xml: str) -> tuple[int, int]:
+        m = re.search(r'bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"', xml or "")
+        if not m:
+            return 0, 0
+        x1, y1, x2, y2 = map(int, m.groups())
+        return max(0, x2 - x1), max(0, y2 - y1)
+
+    @staticmethod
+    def _node_is_full_screen(
+        w: int, h: int, screen_w: int = 0, screen_h: int = 0
+    ) -> bool:
+        """True só para o container da tela toda — linhas HDMI largas passam."""
+        if screen_w > 0 and screen_h > 0:
+            return w >= int(screen_w * 0.90) and h >= int(screen_h * 0.45)
+        return w >= 1000 and h >= 700
 
     @staticmethod
     def _bounds_center(bounds: str) -> tuple[int, int] | None:
