@@ -47,11 +47,25 @@ class TestCheckUpdates(unittest.TestCase):
             hdrs=None,  # type: ignore[arg-type]
             fp=None,
         )
-        with mock.patch("aibox.updater.urllib.request.urlopen", side_effect=err):
+        with mock.patch("aibox.github_fetch.urllib.request.urlopen", side_effect=err):
             result = check_for_updates(current_version="1.0.0")
         self.assertFalse(result.update_available)
         self.assertEqual(result.current_version, "1.0.0")
         self.assertEqual(result.remote.version, "1.0.0")
+
+    def test_http_429_is_not_up_to_date(self) -> None:
+        err = urllib.error.HTTPError(
+            url="https://raw.githubusercontent.com/ChavesSD/ReleasesAibox/main/latest.json",
+            code=429,
+            msg="Too Many Requests",
+            hdrs=None,  # type: ignore[arg-type]
+            fp=None,
+        )
+        with mock.patch("aibox.github_fetch.urllib.request.urlopen", side_effect=err):
+            with mock.patch("aibox.github_fetch.time.sleep"):
+                with self.assertRaises(UpdateError) as ctx:
+                    check_for_updates(current_version="1.0.0")
+        self.assertIn("limitou", str(ctx.exception).lower())
 
 
 class TestManifest(unittest.TestCase):
@@ -109,6 +123,78 @@ class TestApksManifest(unittest.TestCase):
             "https://cdn.jsdelivr.net/gh/ChavesSD/ReleasesAibox@main/apks.json",
             mirrors,
         )
+        self.assertIn(
+            "https://github.com/ChavesSD/ReleasesAibox/raw/refs/heads/main/apks.json",
+            mirrors,
+        )
+
+    def test_latest_json_has_mirrors(self) -> None:
+        from aibox.github_fetch import releases_mirror_urls
+
+        url = "https://raw.githubusercontent.com/ChavesSD/ReleasesAibox/main/latest.json"
+        mirrors = releases_mirror_urls(url)
+        self.assertIn(
+            "https://cdn.jsdelivr.net/gh/ChavesSD/ReleasesAibox@main/latest.json",
+            mirrors,
+        )
+
+    def test_parse_repo_asset_name(self) -> None:
+        from aibox.apk_sync import parse_repo_asset_name
+
+        self.assertEqual(parse_repo_asset_name("Totem-Upzz.apk"), ("Totem", "Upzz.apk"))
+        self.assertEqual(
+            parse_repo_asset_name("Totem-Ai_Horizontal.apk"),
+            ("Totem", "Ai_Horizontal.apk"),
+        )
+        self.assertEqual(
+            parse_repo_asset_name("Outros-ADB_Wifi.apk"),
+            ("Outros", "ADB_Wifi.apk"),
+        )
+        self.assertIsNone(parse_repo_asset_name("Upzz.apk"))
+
+    def test_empty_sha256_keeps_existing_file(self) -> None:
+        from aibox.apk_sync import ApksManifest, RemoteApk, plan_apk_sync
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            local = root / "Totem" / "Upzz.apk"
+            local.parent.mkdir(parents=True)
+            local.write_bytes(b"apk")
+            manifest = ApksManifest(
+                version="1.0.0",
+                updated_at="",
+                apks=(
+                    RemoteApk(
+                        category="Totem",
+                        filename="Upzz.apk",
+                        label="Upzz",
+                        sha256="",
+                        size=3,
+                        url="https://example.com/Totem-Upzz.apk",
+                    ),
+                ),
+            )
+            plan = plan_apk_sync(manifest, root=root)
+        self.assertEqual(plan[0].status, "current")
+
+    def test_http_get_429_then_404_is_not_missing(self) -> None:
+        from aibox.apk_sync import ApksManifestNotFound, UpdateError, _http_get
+
+        def fake_urlopen(req, timeout=None):
+            url = getattr(req, "full_url", str(req))
+            code = 429 if "raw.githubusercontent.com" in url else 404
+            raise urllib.error.HTTPError(url, code, "err", hdrs=None, fp=None)  # type: ignore[arg-type]
+
+        with mock.patch("aibox.github_fetch.urllib.request.urlopen", side_effect=fake_urlopen):
+            with mock.patch("aibox.github_fetch.time.sleep"):
+                with self.assertRaises(UpdateError) as ctx:
+                    _http_get(
+                        "https://raw.githubusercontent.com/ChavesSD/ReleasesAibox/main/apks.json",
+                        timeout_s=1,
+                        accept="application/json",
+                    )
+        self.assertNotIsInstance(ctx.exception, ApksManifestNotFound)
+        self.assertIn("limitou", str(ctx.exception).lower())
 
 
 class TestChecksumAndExtract(unittest.TestCase):

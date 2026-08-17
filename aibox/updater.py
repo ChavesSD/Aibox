@@ -7,12 +7,20 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .github_fetch import (
+    RemoteFetchError,
+    github_release_asset_url,
+    http_get,
+    releases_mirror_urls,
+    ua_headers,
+)
 from .paths import executable_dir, is_frozen
 from .theme import APP_DIR_NAME, APP_VERSION, DEFAULT_UPDATE_MANIFEST_URL
 
@@ -137,24 +145,25 @@ def parse_manifest(data: dict) -> UpdateManifest:
 
 def fetch_manifest(url: str | None = None, *, timeout_s: float = 20.0) -> UpdateManifest:
     target = url or manifest_url()
-    req = urllib.request.Request(
-        target,
-        headers={"User-Agent": f"Aibox/{APP_VERSION}", "Accept": "application/json"},
-        method="GET",
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            raw = resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code in (404, 410):
+        raw, _working = http_get(target, timeout_s=timeout_s, accept="application/json")
+    except TimeoutError as e:
+        raise UpdateError("Timeout ao buscar atualizações.") from e
+    except RemoteFetchError as e:
+        if e.only_missing:
             raise ManifestNotFound(
                 "Nenhuma atualização publicada no servidor."
             ) from e
-        raise UpdateError(f"Falha ao buscar manifesto (HTTP {e.code}).") from e
-    except urllib.error.URLError as e:
-        raise UpdateError(f"Sem conexão ao buscar atualizações: {e.reason}") from e
-    except TimeoutError as e:
-        raise UpdateError("Timeout ao buscar atualizações.") from e
+        if e.rate_limited:
+            raise UpdateError(
+                "O GitHub limitou as requisições ao buscar atualizações. "
+                "Espere um minuto e tente de novo."
+            ) from e
+        code = e.http_codes[-1] if e.http_codes else None
+        if code and code not in (403, 404, 410, 429, 502, 503):
+            raise UpdateError(f"Falha ao buscar manifesto (HTTP {code}).") from e
+        reason = e.last_reason or e
+        raise UpdateError(f"Sem conexão ao buscar atualizações: {reason}") from e
 
     try:
         data = json.loads(raw.decode("utf-8"))
@@ -214,6 +223,29 @@ def sha256_file(path: Path, *, chunk: int = 1024 * 1024) -> str:
     return h.hexdigest()
 
 
+def _stream_url_to_file(
+    url: str,
+    partial: Path,
+    *,
+    size_hint: int,
+    progress: ProgressCb | None,
+    timeout_s: float,
+) -> None:
+    req = urllib.request.Request(url, headers=ua_headers("*/*"), method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        total = int(resp.headers.get("Content-Length") or size_hint or 0)
+        downloaded = 0
+        with partial.open("wb") as out:
+            while True:
+                block = resp.read(256 * 1024)
+                if not block:
+                    break
+                out.write(block)
+                downloaded += len(block)
+                if progress:
+                    progress(downloaded, total)
+
+
 def download_asset(
     asset: ReleaseAsset,
     dest: Path,
@@ -226,28 +258,58 @@ def download_asset(
     if partial.exists():
         partial.unlink()
 
-    req = urllib.request.Request(
-        asset.url,
-        headers={"User-Agent": f"Aibox/{APP_VERSION}"},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            total = int(resp.headers.get("Content-Length") or asset.size or 0)
-            downloaded = 0
-            with partial.open("wb") as out:
-                while True:
-                    block = resp.read(256 * 1024)
-                    if not block:
-                        break
-                    out.write(block)
-                    downloaded += len(block)
-                    if progress:
-                        progress(downloaded, total)
-    except urllib.error.HTTPError as e:
-        raise UpdateError(f"Falha no download (HTTP {e.code}).") from e
-    except urllib.error.URLError as e:
-        raise UpdateError(f"Falha no download: {e.reason}") from e
+    urls = releases_mirror_urls(asset.url) or [asset.url]
+    last_error: Exception | None = None
+    for url in urls:
+        for attempt in range(2):
+            try:
+                _stream_url_to_file(
+                    url,
+                    partial,
+                    size_hint=asset.size,
+                    progress=progress,
+                    timeout_s=timeout_s,
+                )
+                last_error = None
+                break
+            except urllib.error.HTTPError as e:
+                last_error = UpdateError(f"Falha no download (HTTP {e.code}).")
+                if e.code == 429 and attempt == 0:
+                    time.sleep(1.5)
+                    continue
+                break
+            except urllib.error.URLError as e:
+                last_error = UpdateError(f"Falha no download: {e.reason}")
+                break
+            except TimeoutError as e:
+                last_error = UpdateError("Timeout no download da atualização.")
+                last_error.__cause__ = e
+                break
+        if last_error is None:
+            break
+
+    if last_error is not None:
+        resolved = github_release_asset_url(asset.url, timeout_s=timeout_s)
+        if resolved and resolved not in urls:
+            try:
+                _stream_url_to_file(
+                    resolved,
+                    partial,
+                    size_hint=asset.size,
+                    progress=progress,
+                    timeout_s=timeout_s,
+                )
+                last_error = None
+            except Exception as e:
+                last_error = e if isinstance(e, UpdateError) else UpdateError(str(e))
+
+    if last_error is not None:
+        try:
+            if partial.exists():
+                partial.unlink()
+        except OSError:
+            pass
+        raise last_error
 
     partial.replace(dest)
     if progress and asset.size:
@@ -269,8 +331,9 @@ def stage_update_package(
     progress: ProgressCb | None = None,
 ) -> Path:
     dest = updates_dir() / manifest.asset.name
-    download_asset(manifest.asset, dest, progress=progress)
-    verify_sha256(dest, manifest.asset.sha256)
+    download_asset(manifest.asset, dest, progress=progress, timeout_s=300.0)
+    if manifest.asset.sha256:
+        verify_sha256(dest, manifest.asset.sha256)
     return dest
 
 

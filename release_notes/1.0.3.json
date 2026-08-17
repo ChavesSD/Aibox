@@ -1,0 +1,15 @@
+{
+  "version": "1.0.3",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-17",
+  "notes": {
+    "added": [],
+    "fixed": [
+      "Download de APKs: o app não confundia mais um espelho 404 com catálogo inexistente",
+      "Mapeia nomes do GitHub (Totem-Upzz.apk) para a pasta local Totem/Upzz.apk",
+      "Busca de atualizações usa os mesmos espelhos/API do GitHub (não falha só no raw.githubusercontent)"
+    ],
+    "removed": []
+  }
+}

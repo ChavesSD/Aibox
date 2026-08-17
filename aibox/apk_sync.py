@@ -3,22 +3,25 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .apks_catalog import APK_CATALOG, ApkEntry, apks_root, ensure_apks_tree
-from .theme import APP_VERSION, DEFAULT_APKS_MANIFEST_URL
-from .updater import ReleaseAsset, UpdateError, download_asset, sha256_file, verify_sha256
-
-# raw.githubusercontent.com costuma falhar em DNS/firewall; jsDelivr é o espelho.
-_RELEASES_PREFIXES = (
-    "https://raw.githubusercontent.com/ChavesSD/ReleasesAibox/main/",
-    "https://github.com/ChavesSD/ReleasesAibox/raw/main/",
-    "https://cdn.jsdelivr.net/gh/ChavesSD/ReleasesAibox@main/",
+from .apks_catalog import APK_CATALOG, APK_CATEGORIES, ApkEntry, apks_root, ensure_apks_tree
+from .github_fetch import (
+    GITHUB_API_CONTENTS,
+    GITHUB_REPO,
+    RemoteFetchError,
+    github_api_file as _github_api_file,
+    http_get as _shared_http_get,
+    relative_from_url as _relative_from_url,
+    releases_mirror_urls,
+    rewrite_url_to_working_host as _rewrite_url_to_working_host,
+    ua_headers as _ua_headers,
 )
+from .theme import DEFAULT_APKS_MANIFEST_URL
+from .updater import ReleaseAsset, UpdateError, download_asset, sha256_file, verify_sha256
 
 ProgressCb = Callable[[int, int], None]
 ItemCb = Callable[[str], None]
@@ -71,41 +74,15 @@ def apks_manifest_url() -> str:
     return (os.environ.get("AIBOX_APKS_MANIFEST_URL") or DEFAULT_APKS_MANIFEST_URL).strip()
 
 
-def releases_mirror_urls(url: str) -> list[str]:
-    """URLs alternativas do mesmo arquivo no ReleasesAibox."""
-    target = (url or "").strip()
-    if not target:
-        return []
-    ordered: list[str] = []
-
-    def _add(item: str) -> None:
-        if item and item not in ordered:
-            ordered.append(item)
-
-    _add(target)
-    relative = ""
-    for prefix in _RELEASES_PREFIXES:
-        if target.startswith(prefix):
-            relative = target[len(prefix) :]
-            break
-    if relative:
-        for prefix in _RELEASES_PREFIXES:
-            _add(prefix + relative)
-    return ordered
-
-
-def _rewrite_url_to_working_host(url: str, working_url: str) -> str:
-    working_prefix = ""
-    for prefix in _RELEASES_PREFIXES:
-        if working_url.startswith(prefix):
-            working_prefix = prefix
-            break
-    if not working_prefix:
-        return url
-    for prefix in _RELEASES_PREFIXES:
-        if url.startswith(prefix):
-            return working_prefix + url[len(prefix) :]
-    return url
+def parse_repo_asset_name(name: str) -> tuple[str, str] | None:
+    """Nome no GitHub (Totem-Upzz.apk) → (categoria, arquivo do catálogo)."""
+    name = (name or "").strip()
+    if not name.lower().endswith(".apk") or "-" not in name:
+        return None
+    category, filename = name.split("-", 1)
+    if category not in APK_CATEGORIES or not filename:
+        return None
+    return category, filename
 
 
 def _connection_error(reason: object) -> UpdateError:
@@ -119,28 +96,19 @@ def _connection_error(reason: object) -> UpdateError:
 
 
 def _http_get(url: str, *, timeout_s: float, accept: str) -> tuple[bytes, str]:
-    last_http: urllib.error.HTTPError | None = None
-    last_reason: object | None = None
-    for candidate in releases_mirror_urls(url):
-        req = urllib.request.Request(
-            candidate,
-            headers={"User-Agent": f"Aibox/{APP_VERSION}", "Accept": accept},
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                return resp.read(), candidate
-        except urllib.error.HTTPError as e:
-            last_http = e
-            if e.code not in (403, 404, 410, 429, 502, 503):
-                raise UpdateError(f"Falha ao buscar catálogo de APKs (HTTP {e.code}).") from e
-        except urllib.error.URLError as e:
-            last_reason = e.reason
-        except TimeoutError:
-            last_reason = "timeout"
-    if last_http is not None and last_http.code in (404, 410):
-        raise ApksManifestNotFound("Catálogo de APKs ainda não publicado.") from last_http
-    raise _connection_error(last_reason or "falha de rede")
+    try:
+        return _shared_http_get(url, timeout_s=timeout_s, accept=accept)
+    except RemoteFetchError as e:
+        if e.only_missing:
+            raise ApksManifestNotFound("Catálogo de APKs ainda não publicado.") from e
+        if e.rate_limited:
+            raise UpdateError(
+                "O GitHub limitou as requisições ao baixar APKs. Espere um minuto e tente de novo."
+            ) from e
+        code = e.http_codes[-1] if e.http_codes else None
+        if code and code not in (403, 404, 410, 429, 502, 503):
+            raise UpdateError(f"Falha ao buscar catálogo de APKs (HTTP {code}).") from e
+        raise _connection_error(e.last_reason or e) from e
 
 
 def parse_apks_manifest(data: dict) -> ApksManifest:
@@ -178,10 +146,21 @@ def fetch_apks_manifest(url: str | None = None, *, timeout_s: float = 20.0) -> A
     try:
         raw, working = _http_get(target, timeout_s=timeout_s, accept="application/json")
     except TimeoutError as e:
+        listed = _manifest_from_github_assets(timeout_s=timeout_s)
+        if listed is not None:
+            return listed
         raise UpdateError("Timeout ao buscar catálogo de APKs.") from e
+    except UpdateError:
+        listed = _manifest_from_github_assets(timeout_s=timeout_s)
+        if listed is not None:
+            return listed
+        raise
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        listed = _manifest_from_github_assets(timeout_s=timeout_s)
+        if listed is not None:
+            return listed
         raise UpdateError("Catálogo de APKs não é JSON válido.") from e
     if not isinstance(payload, dict):
         raise UpdateError("Catálogo de APKs deve ser um objeto JSON.")
@@ -193,7 +172,9 @@ def fetch_apks_manifest(url: str | None = None, *, timeout_s: float = 20.0) -> A
             label=apk.label,
             sha256=apk.sha256,
             size=apk.size,
-            url=_rewrite_url_to_working_host(apk.url, working),
+            url=_rewrite_url_to_working_host(apk.url, working)
+            if not working.startswith("github-api:")
+            else apk.url,
         )
         for apk in manifest.apks
     )
@@ -202,6 +183,49 @@ def fetch_apks_manifest(url: str | None = None, *, timeout_s: float = 20.0) -> A
         updated_at=manifest.updated_at,
         apks=rewritten,
     )
+
+
+def _manifest_from_github_assets(*, timeout_s: float = 20.0) -> ApksManifest | None:
+    """Lista apk_assets/ na API (Totem-Upzz.apk → Totem/Upzz.apk) se o JSON falhar."""
+    req = urllib.request.Request(
+        GITHUB_API_CONTENTS + "apk_assets",
+        headers=_ua_headers("application/vnd.github+json"),
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            items = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(items, list):
+        return None
+    catalog = {(e.category, e.filename): e for e in APK_CATALOG}
+    apks: list[RemoteApk] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "file":
+            continue
+        parsed = parse_repo_asset_name(str(item.get("name") or ""))
+        if parsed is None:
+            continue
+        category, filename = parsed
+        entry = catalog.get((category, filename))
+        name = str(item.get("name") or "")
+        url = str(item.get("download_url") or "").strip() or (
+            f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/apk_assets/{name}"
+        )
+        apks.append(
+            RemoteApk(
+                category=category,
+                filename=filename,
+                label=(entry.label if entry else filename),
+                sha256="",
+                size=int(item.get("size") or 0),
+                url=url,
+            )
+        )
+    if not apks:
+        return None
+    return ApksManifest(version="github-assets", updated_at="", apks=tuple(apks))
 
 
 def _local_sha(path: Path) -> str | None:
@@ -225,6 +249,8 @@ def plan_apk_sync(manifest: ApksManifest, *, root: Path | None = None) -> list[A
         digest = _local_sha(local)
         if digest is None:
             status = "missing"
+        elif not remote.sha256:
+            status = "current"
         elif digest.lower() == remote.sha256.lower():
             status = "current"
         else:
@@ -268,12 +294,27 @@ def sync_apks(
             )
             try:
                 download_asset(asset, item.local, progress=progress, timeout_s=300.0)
-                verify_sha256(item.local, item.remote.sha256)
+                if item.remote.sha256:
+                    verify_sha256(item.local, item.remote.sha256)
                 downloaded += 1
                 last_error = None
                 break
             except Exception as e:
                 last_error = e
+        if last_error is not None:
+            relative = _relative_from_url(item.remote.url)
+            if not relative and item.remote.filename:
+                relative = f"apk_assets/{item.remote.category}-{item.remote.filename}"
+            if relative:
+                try:
+                    data = _github_api_file(relative, timeout_s=300.0)
+                    item.local.write_bytes(data)
+                    if item.remote.sha256:
+                        verify_sha256(item.local, item.remote.sha256)
+                    downloaded += 1
+                    last_error = None
+                except Exception as e:
+                    last_error = e
         if last_error is not None:
             failed.append(f"{label}: {last_error}")
             try:
