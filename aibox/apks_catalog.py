@@ -24,6 +24,7 @@ APK_CATALOG: tuple[ApkEntry, ...] = (
     ApkEntry("Totem", "Atendimento Inteligente", "Atendimento_Inteligente.apk"),
     ApkEntry("Totem", "Totem Interativo", "Totem_Interativo.apk"),
     ApkEntry("Totem", "Upzz", "Upzz.apk"),
+    ApkEntry("Totem", "AI Horizontal", "Ai_Horizontal.apk"),
     ApkEntry("Painel", "Atendimento Inteligente", "Atendimento_Inteligente.apk"),
     ApkEntry("Painel", "Painel Cirurgico", "Painel_Cirurgico.apk"),
     ApkEntry("Painel", "Aiclass", "Aiclass.apk"),

@@ -232,4 +232,10 @@ class TestAutostartInstallDeps(unittest.TestCase):
         self.assertIn("Aiclass", labels)
         self.assertIn("Aiclass - Painel", labels)
         self.assertNotIn("Painel", labels)
-        self.assertNotIn("Totem", labels)
+
+
+class TestApkCatalog(unittest.TestCase):
+    def test_ai_horizontal_is_in_totem(self) -> None:
+        entry = _catalog("Totem", "Ai_Horizontal.apk")
+        self.assertEqual(entry.label, "AI Horizontal")
+        self.assertTrue(wants_boot_autostart(entry))

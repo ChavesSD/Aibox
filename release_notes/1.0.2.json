@@ -1,0 +1,13 @@
+{
+  "version": "1.0.2",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-17",
+  "notes": {
+    "added": [
+      "APK AI Horizontal no catálogo Totem (download pelo Aibox)"
+    ],
+    "fixed": [],
+    "removed": []
+  }
+}
