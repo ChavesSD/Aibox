@@ -160,7 +160,7 @@ class TestVoiceVXml(unittest.TestCase):
     def test_tts_dpad_recipe_counts(self) -> None:
         self.assertEqual(Adb.TTS_PT_BR_DOWN_COUNT, 38)
         self.assertEqual(Adb.TTS_VOICE_V_DOWN_COUNT, 5)
-        self.assertEqual(Adb.TTS_PT_BR_DOWNLOAD_WAIT_S, 10)
+        self.assertEqual(Adb.TTS_PT_BR_DOWNLOAD_WAIT_S, 30)
         cmd38 = Adb._tts_keyevent_cmd(38, enter=False)
         self.assertTrue(cmd38.startswith("input keyevent "))
         self.assertEqual(cmd38.split().count("20"), 38)

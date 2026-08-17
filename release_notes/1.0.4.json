@@ -1,0 +1,13 @@
+{
+  "version": "1.0.4",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-17",
+  "notes": {
+    "added": [],
+    "fixed": [
+      "Síntese de Voz: espera 30s após português (Brasil) para a voz terminar de baixar"
+    ],
+    "removed": []
+  }
+}

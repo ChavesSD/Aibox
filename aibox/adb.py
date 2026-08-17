@@ -1768,7 +1768,7 @@ class Adb:
 
     TTS_PT_BR_DOWN_COUNT = 38
     TTS_VOICE_V_DOWN_COUNT = 5
-    TTS_PT_BR_DOWNLOAD_WAIT_S = 10
+    TTS_PT_BR_DOWNLOAD_WAIT_S = 30
 
     @staticmethod
     def _tts_keyevent_cmd(downs: int, *, enter: bool = False) -> str:
