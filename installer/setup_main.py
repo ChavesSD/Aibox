@@ -268,9 +268,10 @@ def run_gui() -> int:
     root.title("Aibox — Instalação")
     root.configure(bg=BG)
     root.resizable(False, False)
-    w, h = 460, 340
+    w, h = 520, 420
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
-    root.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 2}")
+    root.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2)}")
+    root.minsize(480, 380)
     _set_dark_titlebar(root)
 
     icon_png = _resource_path("Aibox.png")
@@ -289,6 +290,9 @@ def run_gui() -> int:
     pad = tk.Frame(root, bg=BG)
     pad.pack(fill="both", expand=True, padx=28, pady=22)
 
+    btns = tk.Frame(pad, bg=BG)
+    btns.pack(side="bottom", fill="x", pady=(12, 0))
+
     header = tk.Frame(pad, bg=BG)
     header.pack(fill="x")
     if photo is not None:
@@ -305,12 +309,16 @@ def run_gui() -> int:
 
     tk.Label(
         pad,
-        text="Instala o Aibox em C:\\Aibox, com atalhos na Área de Trabalho\ne no Menu Iniciar. Os APKs são baixados depois, pelo próprio app.",
+        text=(
+            "Instala o Aibox em C:\\Aibox, com atalhos na Área de Trabalho "
+            "e no Menu Iniciar. Os APKs são baixados depois, pelo próprio app."
+        ),
         fg=SUBTLE,
         bg=BG,
         font=body_font,
         justify="left",
         anchor="w",
+        wraplength=440,
     ).pack(fill="x", pady=(18, 8))
 
     dest = tk.Frame(pad, bg=SURFACE)
@@ -322,13 +330,10 @@ def run_gui() -> int:
     tk.Label(pad, textvariable=status, fg=SUBTLE, bg=BG, font=small_font, anchor="w").pack(fill="x")
 
     bar_bg = tk.Frame(pad, bg=SURFACE, height=10)
-    bar_bg.pack(fill="x", pady=(8, 18))
+    bar_bg.pack(fill="x", pady=(8, 4))
     bar_bg.pack_propagate(False)
     bar_fill = tk.Frame(bar_bg, bg=PRIMARY, width=0, height=10)
     bar_fill.place(x=0, y=0, relheight=1)
-
-    btns = tk.Frame(pad, bg=BG)
-    btns.pack(fill="x", side="bottom")
 
     result: dict = {"exe": None, "error": None, "busy": False}
 
@@ -455,6 +460,15 @@ def run_gui() -> int:
     install_btn.bind("<Enter>", hover_on)
     install_btn.bind("<Leave>", hover_off)
 
+    def _fit_window() -> None:
+        root.update_idletasks()
+        need_w = min(max(w, pad.winfo_reqwidth() + 56), max(480, sw - 40))
+        need_h = min(max(h, pad.winfo_reqheight() + 56), max(380, sh - 80))
+        root.geometry(
+            f"{need_w}x{need_h}+{max(0, (sw - need_w) // 2)}+{max(0, (sh - need_h) // 2)}"
+        )
+
+    root.after_idle(_fit_window)
     root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
     return 0 if result.get("exe") or not result.get("error") else 1
