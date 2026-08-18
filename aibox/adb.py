@@ -1927,9 +1927,8 @@ class Adb:
         if not started:
             return False
         self._tts_wait_installer_focused(serial, engine, timeout_s=6.0)
-        self._tts_wait_voice_installer_ready(
-            serial, engine, timeout_s=self.TTS_INSTALLER_READY_WAIT_S
-        )
+        # Sem uiautomator aqui: o dump rouba o foco e as setas deixam de andar.
+        time.sleep(self.TTS_LIST_PAINT_WAIT_S)
         return True
 
     def _tts_wait_installer_focused(
@@ -2003,6 +2002,7 @@ class Adb:
     TTS_VOICE_V_DOWN_COUNT = 5
     TTS_PT_BR_DOWNLOAD_WAIT_S = 30
     TTS_PT_BR_DOWNLOAD_POLL_S = 30
+    TTS_LIST_PAINT_WAIT_S = 5
     TTS_INSTALLER_READY_WAIT_S = 15
     CONFIG_RETRY_ATTEMPTS = 2
 
@@ -2015,29 +2015,27 @@ class Adb:
         return "input keyevent " + " ".join(codes)
 
     def _tts_dpad_down(self, serial: str, downs: int) -> None:
-        """DPAD baixo em lotes. Um único `input keyevent 20 20 20...` no Mini PC
-        costuma aplicar só 1 tecla, então a lista não anda."""
-        remaining = max(0, int(downs))
-        while remaining > 0:
-            n = min(8, remaining)
-            cmd = "; ".join(["input keyevent 20"] * n)
-            self.shell_try(serial, cmd, timeout_s=8)
-            remaining -= n
-            if remaining:
-                time.sleep(0.06)
+        """Um `input` com todos os códigos. No Allwinner, `input; input; input` não anda a lista."""
+        n = max(0, int(downs))
+        if n <= 0:
+            return
+        self.shell_try(serial, "input keyevent 20", timeout_s=3)
+        time.sleep(0.28)
+        rest = n - 1
+        if rest:
+            self.shell_try(
+                serial,
+                self._tts_keyevent_cmd(rest, enter=False),
+                timeout_s=10,
+            )
+            time.sleep(0.2)
 
     def _tts_focus_language_list(self, serial: str) -> None:
-        """O destaque precisa estar na lista; senão P-O-R e as setas se perdem."""
-        self.shell_try(serial, "input keyevent 20; input keyevent 20", timeout_s=3)
-        time.sleep(0.12)
+        self.shell_try(serial, "input keyevent 20", timeout_s=3)
+        time.sleep(0.2)
 
     def _tts_typeahead_por(self, serial: str) -> None:
-        """P-O-R no teclado DPAD — pula a lista até o bloco Português."""
-        self.shell_try(
-            serial,
-            "input keyevent 44; input keyevent 43; input keyevent 46",
-            timeout_s=3,
-        )
+        self.shell_try(serial, "input keyevent 44 43 46", timeout_s=3)
         time.sleep(0.28)
 
     def _tts_press_enter(self, serial: str) -> None:
@@ -2063,53 +2061,33 @@ class Adb:
         *,
         on_status: Callable[[str], None] | None = None,
     ) -> tuple[bool, list[str]]:
-        """Espera a lista aparecer, toca português (Brasil), espera o download, marca Voz V.
-
-        Na primeira abertura o instalador fica preto/vazio: clicar 38× nessa hora
-        seleciona outro país. Só navega depois que o dump mostra a lista.
-        """
+        """38× baixo num único input + Enter. Sem dump no meio (senão a lista congela)."""
 
         def status(msg: str) -> None:
             if on_status:
                 on_status(msg)
 
         trail: list[str] = []
-        status("TTS: esperando a lista de idiomas abrir…")
-        self.shell_try(serial, "input keyevent 224; svc power stayon true", timeout_s=4)
-        ready = self._tts_wait_voice_installer_ready(
-            serial, "", timeout_s=self.TTS_INSTALLER_READY_WAIT_S
-        )
+        status("TTS: 38× baixo até português (Brasil)…")
+        self._tts_dpad_down(serial, self.TTS_PT_BR_DOWN_COUNT)
+        trail.append("38-down")
+        status("TTS: Enter em português (Brasil).")
+        self._tts_press_enter(serial)
+        trail.append("enter-pt-BR")
+        time.sleep(1.2)
         xml = self._dump_ui_xml(serial) or ""
         screen = self._tts_classify_screen(xml)
-        trail.append(f"tela-inicial={screen}")
-        if ready:
-            trail.append("lista-pronta")
-        else:
-            trail.append("lista-lenta")
-
-        if screen in {"voices", "download", "busy"}:
-            trail.append("idioma-ja-ok")
-        else:
-            picked, extra = self._tts_select_portuguese_brazil(serial, xml, status)
+        trail.append(f"apos-enter={screen}")
+        if screen == "country":
+            status("TTS: tela de país — Brasil.")
+            ok_br, extra = self._tts_open_country_brazil(
+                serial, xml, status
+            )
             trail.extend(extra)
-            if not picked:
-                xml = self._dump_ui_xml(serial) or ""
-                screen = self._tts_classify_screen(xml)
-                if screen in {"language", "country"} or not (xml or "").strip():
-                    status("TTS: 38× baixo até português (Brasil)…")
-                    self._tts_dpad_down(serial, self.TTS_PT_BR_DOWN_COUNT)
-                    trail.append("38-down")
-                    confirmed, extra2 = self._tts_confirm_pt_br_after_scroll(
-                        serial, status
-                    )
-                    trail.extend(extra2)
-                    if not confirmed:
-                        status("TTS: Enter em português (Brasil).")
-                        self._tts_press_enter(serial)
-                        trail.append("enter-pt-BR")
-                else:
-                    trail.append("nao-selecionou-pt-BR")
-                    return False, trail
+            if not ok_br:
+                self._tts_dpad_down(serial, 3)
+                self._tts_press_enter(serial)
+                trail.append("enter-brasil")
 
         status(
             f"TTS: aguardando download de português (Brasil) "

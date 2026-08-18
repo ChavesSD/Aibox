@@ -1,0 +1,13 @@
+{
+  "version": "1.0.9",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-18",
+  "notes": {
+    "added": [],
+    "fixed": [
+      "Síntese de Voz: a lista de idiomas volta a rolar até português (Brasil) sem travar na tela"
+    ],
+    "removed": []
+  }
+}
