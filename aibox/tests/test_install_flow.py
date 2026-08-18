@@ -258,6 +258,21 @@ class TestVoiceVXml(unittest.TestCase):
         cmd5 = Adb._tts_keyevent_cmd(5, enter=False)
         self.assertEqual(cmd5.split().count("20"), 5)
 
+    def test_dpad_down_sends_separate_keyevents(self) -> None:
+        adb = Adb.__new__(Adb)
+        cmds: list[str] = []
+        adb.shell_try = lambda _s, cmd, timeout_s=8: cmds.append(cmd)  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            Adb._tts_dpad_down(adb, "serial", 10)
+        joined = " | ".join(cmds)
+        self.assertIn("input keyevent 20; input keyevent 20", joined)
+        self.assertFalse(any(c.startswith("input keyevent 20 20") for c in cmds))
+
+    def test_center_rejects_off_screen_row(self) -> None:
+        self.assertTrue(Adb._tts_center_on_screen(960, 400, 1920, 1080))
+        self.assertFalse(Adb._tts_center_on_screen(960, 1400, 1920, 1080))
+        self.assertFalse(Adb._tts_center_on_screen(960, 10, 1920, 1080))
+
     def test_voice_list_detects_voz_v(self) -> None:
         self.assertTrue(Adb.xml_has_voice_list('<node text="Voz V"/>'))
         self.assertFalse(Adb.xml_has_voice_list('<node text="Português"/>'))
@@ -314,7 +329,7 @@ class TestVoiceVXml(unittest.TestCase):
         self.assertTrue(ok)
         self.assertGreaterEqual(step["n"], 4)
 
-    def test_navigate_taps_visible_pt_br_without_blind_dpad(self) -> None:
+    def test_navigate_uses_dpad_enter_when_pt_br_visible(self) -> None:
         language = (
             '<hierarchy bounds="[0,0][1920,1080]">'
             '<node text="English" bounds="[0,200][1920,280]"/>'
@@ -328,30 +343,62 @@ class TestVoiceVXml(unittest.TestCase):
             "</hierarchy>"
         )
         adb = Adb.__new__(Adb)
-        taps: list[tuple[int, int]] = []
         downs: list[object] = []
+        enters = {"n": 0}
         dumps = {"n": 0}
 
         def dump(_serial: str) -> str:
             dumps["n"] += 1
-            return language if dumps["n"] == 1 else voices
+            return language if dumps["n"] <= 2 else voices
 
         adb._tts_wait_voice_installer_ready = lambda *_a, **_k: True  # type: ignore[method-assign]
         adb._dump_ui_xml = dump  # type: ignore[method-assign]
         adb.shell_try = lambda *_a, **_k: "ok"  # type: ignore[method-assign]
         adb._tts_dpad_down = lambda _s, n: downs.append(n)  # type: ignore[method-assign]
-        adb._tts_press_enter = lambda *_a, **_k: downs.append("enter")  # type: ignore[method-assign]
-        adb._tap_only = (  # type: ignore[method-assign]
-            lambda _s, x, y: taps.append((x, y)) or True
-        )
+        adb._tts_press_enter = lambda *_a, **_k: enters.update(n=enters["n"] + 1)  # type: ignore[method-assign]
+        adb._tap_only = lambda *_a, **_k: True  # type: ignore[method-assign]
         adb._wait_ui_change = lambda *_a, **_k: voices  # type: ignore[method-assign]
         adb._tts_select_voice_v_now = lambda *_a, **_k: True  # type: ignore[method-assign]
+        adb._tts_focus_language_list = lambda *_a, **_k: None  # type: ignore[method-assign]
+        adb._tts_typeahead_por = lambda *_a, **_k: None  # type: ignore[method-assign]
         with mock.patch("aibox.adb.time.sleep"):
             ok, trail = Adb._tts_navigate_installer(adb, "serial")
         self.assertTrue(ok)
-        self.assertIn("tap-pt-BR", trail)
+        self.assertIn("enter-pt-BR", trail)
+        self.assertIn("foco", trail)
+        self.assertIn("por", trail)
         self.assertNotIn(38, downs)
-        self.assertTrue(taps)
+        self.assertGreaterEqual(enters["n"], 1)
+
+    def test_tap_without_leaving_language_list_is_not_success(self) -> None:
+        language = (
+            '<hierarchy bounds="[0,0][1920,1080]">'
+            '<node text="English" bounds="[0,200][1920,280]"/>'
+            '<node text="Español" bounds="[0,280][1920,360]"/>'
+            '<node text="português (Brasil)" bounds="[80,400][1840,480]"/>'
+            "</hierarchy>"
+        )
+        adb = Adb.__new__(Adb)
+        downs: list[int] = []
+        dumps = {"n": 0}
+
+        def dump(_serial: str) -> str:
+            dumps["n"] += 1
+            return language
+
+        adb._dump_ui_xml = dump  # type: ignore[method-assign]
+        adb.shell_try = lambda *_a, **_k: "ok"  # type: ignore[method-assign]
+        adb._tts_dpad_down = lambda _s, n: downs.append(n)  # type: ignore[method-assign]
+        adb._tts_press_enter = lambda *_a, **_k: None  # type: ignore[method-assign]
+        adb._tap_only = lambda *_a, **_k: True  # type: ignore[method-assign]
+        adb._wait_ui_change = lambda *_a, **_k: language  # type: ignore[method-assign]
+        adb._tts_focus_language_list = lambda *_a, **_k: None  # type: ignore[method-assign]
+        adb._tts_typeahead_por = lambda *_a, **_k: None  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            ok, trail = Adb._tts_select_portuguese_brazil(adb, "serial", language)
+        self.assertFalse(ok)
+        self.assertIn("enter-pt-BR-sem-efeito", trail)
+        self.assertIn(8, downs)
 
 
 class TestFocusParse(unittest.TestCase):

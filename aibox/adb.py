@@ -2015,21 +2015,47 @@ class Adb:
         return "input keyevent " + " ".join(codes)
 
     def _tts_dpad_down(self, serial: str, downs: int) -> None:
-        """Só os cliques para baixo, num único input (rápido, contagem exata)."""
+        """DPAD baixo em lotes. Um único `input keyevent 20 20 20...` no Mini PC
+        costuma aplicar só 1 tecla, então a lista não anda."""
+        remaining = max(0, int(downs))
+        while remaining > 0:
+            n = min(8, remaining)
+            cmd = "; ".join(["input keyevent 20"] * n)
+            self.shell_try(serial, cmd, timeout_s=8)
+            remaining -= n
+            if remaining:
+                time.sleep(0.06)
+
+    def _tts_focus_language_list(self, serial: str) -> None:
+        """O destaque precisa estar na lista; senão P-O-R e as setas se perdem."""
+        self.shell_try(serial, "input keyevent 20; input keyevent 20", timeout_s=3)
+        time.sleep(0.12)
+
+    def _tts_typeahead_por(self, serial: str) -> None:
+        """P-O-R no teclado DPAD — pula a lista até o bloco Português."""
         self.shell_try(
             serial,
-            self._tts_keyevent_cmd(downs, enter=False),
-            timeout_s=8,
+            "input keyevent 44; input keyevent 43; input keyevent 46",
+            timeout_s=3,
         )
+        time.sleep(0.28)
 
     def _tts_press_enter(self, serial: str) -> None:
         """Enter depois que o destaque parou no item (CENTER sozinho no burst não abre)."""
-        time.sleep(0.22)
+        time.sleep(0.18)
         # ENTER (66) + OK/CENTER (23): o Mini PC costuma honrar só um dos dois
         self.shell_try(serial, "input keyevent 66", timeout_s=2)
         time.sleep(0.07)
         self.shell_try(serial, "input keyevent 23", timeout_s=2)
         time.sleep(0.12)
+
+    @staticmethod
+    def _tts_center_on_screen(
+        x: int, y: int, screen_w: int, screen_h: int
+    ) -> bool:
+        if screen_w < 80 or screen_h < 80:
+            screen_w, screen_h = 1920, 1080
+        return 8 <= x < screen_w - 8 and 40 <= y < screen_h - 24
 
     def _tts_navigate_installer(
         self,
@@ -2145,7 +2171,7 @@ class Adb:
         xml: str = "",
         on_status: Callable[[str], None] | None = None,
     ) -> tuple[bool, list[str]]:
-        """Toca português (Brasil) ou Brasil no dump visível. Sem DPAD cego."""
+        """TV/Mini PC: foca a lista, P-O-R, setas e Enter. Tap sozinho não move o destaque."""
 
         def note(msg: str) -> None:
             if on_status:
@@ -2154,45 +2180,91 @@ class Adb:
         current = xml or self._dump_ui_xml(serial) or ""
         screen = self._tts_classify_screen(current)
         if screen == "country":
-            note("TTS: tela de país — tocando Brasil.")
-            if self._tts_click_country_brazil(serial, current):
-                time.sleep(0.35)
-                return True, ["tap-brasil"]
-            return False, ["pais-sem-brasil"]
+            return self._tts_open_country_brazil(serial, current, note)
         if screen != "language":
             return False, [f"tela={screen}"]
 
-        if self._tts_click_portuguese_brazil(serial, current):
-            note("TTS: toquei português (Brasil).")
-            trail = ["tap-pt-BR"]
-            current = self._wait_ui_change(serial, current, timeout_s=2.5) or (
-                self._dump_ui_xml(serial) or current
-            )
-            if self._tts_classify_screen(current) == "country":
-                note("TTS: agora o país — tocando Brasil.")
-                if self._tts_click_country_brazil(serial, current):
-                    trail.append("tap-brasil")
-                    time.sleep(0.3)
+        trail: list[str] = []
+        note("TTS: destacando a lista de idiomas…")
+        self._tts_focus_language_list(serial)
+        trail.append("foco")
+        note("TTS: P-O-R até português…")
+        self._tts_typeahead_por(serial)
+        trail.append("por")
+        current = self._dump_ui_xml(serial) or current
+        screen = self._tts_classify_screen(current)
+        if screen == "country":
+            ok, extra = self._tts_open_country_brazil(serial, current, note)
+            return ok, trail + extra
+
+        opened, extra = self._tts_try_open_visible_pt_br(serial, current, note)
+        trail.extend(extra)
+        if opened:
             return True, trail
 
-        note("TTS: português (Brasil) fora da tela — buscando na lista…")
-        self._tts_jump_to_portuguese_brazil(serial, current)
-        time.sleep(0.4)
-        current = self._dump_ui_xml(serial) or ""
-        trail = ["busca"]
-        if self._tts_click_portuguese_brazil(serial, current):
-            note("TTS: toquei português (Brasil).")
-            trail.append("tap-pt-BR")
-            current = self._wait_ui_change(serial, current, timeout_s=2.5) or current
-            if self._tts_classify_screen(current) == "country":
-                if self._tts_click_country_brazil(serial, current):
-                    trail.append("tap-brasil")
-            return True, trail
-        if self._tts_classify_screen(current) == "country":
-            if self._tts_click_country_brazil(serial, current):
-                note("TTS: toquei Brasil.")
-                return True, trail + ["tap-brasil"]
+        for _ in range(6):
+            note("TTS: descendo a lista até português (Brasil)…")
+            self._tts_dpad_down(serial, 8)
+            trail.append("8-down")
+            current = self._dump_ui_xml(serial) or ""
+            screen = self._tts_classify_screen(current)
+            if screen == "country":
+                ok, extra = self._tts_open_country_brazil(serial, current, note)
+                return ok, trail + extra
+            opened, extra = self._tts_try_open_visible_pt_br(serial, current, note)
+            trail.extend(extra)
+            if opened:
+                return True, trail
         return False, trail + ["sem-pt-BR-visivel"]
+
+    def _tts_try_open_visible_pt_br(
+        self,
+        serial: str,
+        xml: str,
+        note: Callable[[str], None],
+    ) -> tuple[bool, list[str]]:
+        """Enter (e tap extra) só se português (Brasil) estiver visível na tela."""
+        if not self._tts_find_pt_br_center(xml):
+            return False, []
+        note("TTS: Enter em português (Brasil).")
+        pos = self._tts_find_pt_br_center(xml)
+        if pos is not None:
+            self._tap_only(serial, pos[0], pos[1])
+        self._tts_press_enter(serial)
+        current = self._wait_ui_change(serial, xml, timeout_s=2.8) or (
+            self._dump_ui_xml(serial) or xml
+        )
+        screen = self._tts_classify_screen(current)
+        if screen == "language":
+            return False, ["enter-pt-BR-sem-efeito"]
+        extra = ["enter-pt-BR"]
+        if screen == "country":
+            ok, more = self._tts_open_country_brazil(serial, current, note)
+            return ok, extra + more
+        return True, extra
+
+    def _tts_open_country_brazil(
+        self,
+        serial: str,
+        xml: str,
+        note: Callable[[str], None],
+    ) -> tuple[bool, list[str]]:
+        note("TTS: tela de país — Brasil.")
+        pos = self._tts_find_country_brazil_center(xml)
+        if pos is not None:
+            self._tap_only(serial, pos[0], pos[1])
+        self._tts_press_enter(serial)
+        time.sleep(0.3)
+        current = self._dump_ui_xml(serial) or xml
+        if self._tts_classify_screen(current) != "country":
+            return True, ["enter-brasil"]
+        self._tts_dpad_down(serial, 3)
+        self._tts_press_enter(serial)
+        time.sleep(0.25)
+        current = self._dump_ui_xml(serial) or current
+        if self._tts_classify_screen(current) == "country":
+            return False, ["pais-sem-brasil"]
+        return True, ["enter-brasil"]
 
     def _tts_confirm_pt_br_after_scroll(
         self,
@@ -2203,22 +2275,14 @@ class Adb:
         xml = self._dump_ui_xml(serial) or ""
         screen = self._tts_classify_screen(xml)
         if screen == "country":
-            if on_status:
-                on_status("TTS: lista parou no país — tocando Brasil.")
-            if self._tts_click_country_brazil(serial, xml):
-                time.sleep(0.3)
-                return True, ["tap-brasil"]
-            return False, ["pais-sem-brasil"]
+            return self._tts_open_country_brazil(
+                serial, xml, on_status or (lambda _m: None)
+            )
         if self._tts_find_pt_br_center(xml):
-            if self._tts_click_portuguese_brazil(serial, xml):
-                if on_status:
-                    on_status("TTS: toquei português (Brasil).")
-                current = self._wait_ui_change(serial, xml, timeout_s=2.5) or xml
-                extra = ["tap-pt-BR"]
-                if self._tts_classify_screen(current) == "country":
-                    if self._tts_click_country_brazil(serial, current):
-                        extra.append("tap-brasil")
-                return True, extra
+            opened, extra = self._tts_try_open_visible_pt_br(
+                serial, xml, on_status or (lambda _m: None)
+            )
+            return opened, extra
         if screen == "language" and Adb._tts_is_portuguese_brazil(xml):
             if on_status:
                 on_status("TTS: Enter em português (Brasil).")
@@ -2277,6 +2341,8 @@ class Adb:
             x1, y1, x2, y2 = map(int, m.groups())
             w, h = x2 - x1, y2 - y1
             if Adb._node_is_full_screen(w, h, screen_w, screen_h):
+                continue
+            if not Adb._tts_center_on_screen(center[0], center[1], screen_w, screen_h):
                 continue
             hits.append((w * h, center[0], center[1]))
         if not hits:
@@ -2523,6 +2589,8 @@ class Adb:
             x1, y1, x2, y2 = map(int, m.groups())
             w, h = x2 - x1, y2 - y1
             if Adb._node_is_full_screen(w, h, screen_w, screen_h):
+                continue
+            if not Adb._tts_center_on_screen(center[0], center[1], screen_w, screen_h):
                 continue
             hits.append((w * h, center[0], center[1]))
         if not hits:

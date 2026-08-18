@@ -1,0 +1,13 @@
+{
+  "version": "1.0.7",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-18",
+  "notes": {
+    "added": [],
+    "fixed": [
+      "Síntese de Voz: no Mini PC a lista de idiomas passa a ser navegada com o controle (P-O-R e setas) até português (Brasil)"
+    ],
+    "removed": []
+  }
+}
