@@ -32,3 +32,15 @@ def executable_dir() -> Path:
 def resource_path(*parts: str | Path) -> Path:
     """Caminho de recurso empacotado ao lado do pacote."""
     return package_dir().joinpath(*parts)
+
+
+def app_icon_path() -> Path | None:
+    """Ícone da janela/tarefa: .ico nativo; PNG só se o .ico não existir."""
+    ico = resource_path("Aibox.ico")
+    if ico.is_file():
+        return ico
+    png = resource_path("Aibox.png")
+    if png.is_file():
+        return png
+    return None
+

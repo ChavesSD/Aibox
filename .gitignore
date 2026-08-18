@@ -15,10 +15,9 @@ venv/
 Apks/
 *.apk
 
-# Binários ADB (baixados no build)
+# Ícone nativo (não gerar a partir do PNG — fica desfalcado na barra de tarefas)
 aibox/platform-tools/*.exe
 aibox/platform-tools/*.dll
-aibox/Aibox.ico
 
 # IDE / OS
 .idea/

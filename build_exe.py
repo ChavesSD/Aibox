@@ -98,34 +98,17 @@ def _copy_adb_into_dist() -> None:
         print("AVISO: adb.exe não ficou em dist/_internal/aibox/platform-tools", file=sys.stderr)
 
 
-def _png_to_ico(png: Path, ico: Path) -> None:
-    """Gera .ico (PNG embutido, Windows Vista+) para o instalador e o .exe."""
-    import struct
-
-    data = png.read_bytes()
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError(f"Não é PNG: {png}")
-    w, h = struct.unpack(">II", data[16:24])
-    bw = 0 if w >= 256 else int(w)
-    bh = 0 if h >= 256 else int(h)
-    header = struct.pack("<HHH", 0, 1, 1)
-    entry = struct.pack("<BBBBHHII", bw, bh, 0, 0, 1, 32, len(data), 6 + 16)
-    ico.write_bytes(header + entry + data)
-
-
 def _ensure_ico() -> Path | None:
-    png = ROOT / "aibox" / "Aibox.png"
+    """Usa aibox/Aibox.ico. Não regrava a partir do PNG (fica desfalcado no Windows)."""
     ico = ROOT / "aibox" / "Aibox.ico"
-    if not png.is_file():
-        return ico if ico.is_file() else None
-    try:
-        if not ico.is_file() or ico.stat().st_mtime < png.stat().st_mtime:
-            _png_to_ico(png, ico)
-            print(f"Ícone: {ico}")
-        return ico if ico.is_file() else None
-    except Exception as e:
-        print(f"AVISO: não foi possível gerar Aibox.ico ({e})", file=sys.stderr)
-        return ico if ico.is_file() else None
+    if ico.is_file():
+        print(f"Ícone: {ico}")
+        return ico
+    print(
+        "AVISO: aibox/Aibox.ico ausente — o .exe ficará sem ícone nativo.",
+        file=sys.stderr,
+    )
+    return None
 
 
 def _app_version() -> str:

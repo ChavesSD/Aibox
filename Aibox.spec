@@ -24,7 +24,7 @@ _ADB_FILES = (
 )
 
 datas: list[tuple[str, str]] = []
-for name in ("Aibox.png", "Logo para tema escuro.png"):
+for name in ("Aibox.ico", "Aibox.png", "Logo para tema escuro.png"):
     src = PKG / name
     if src.exists():
         datas.append((str(src), "aibox"))

@@ -274,12 +274,19 @@ def run_gui() -> int:
     root.minsize(480, 380)
     _set_dark_titlebar(root)
 
+    icon_ico = _resource_path("Aibox.ico")
     icon_png = _resource_path("Aibox.png")
     photo = None
+    if icon_ico.is_file():
+        try:
+            root.iconbitmap(default=str(icon_ico))
+        except Exception:
+            pass
     if icon_png.is_file():
         try:
             photo = tk.PhotoImage(file=str(icon_png))
-            root.iconphoto(True, photo)
+            if not icon_ico.is_file():
+                root.iconphoto(True, photo)
         except Exception:
             photo = None
 

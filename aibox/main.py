@@ -7,7 +7,7 @@ from PySide6.QtGui import QIcon, QFont
 from PySide6.QtCore import Qt
 
 from .main_window import MainWindow
-from .paths import resource_path
+from .paths import app_icon_path
 from .theme import APP_NAME, aibox_stylesheet
 
 
@@ -17,11 +17,11 @@ def main() -> int:
     app.setOrganizationName("Intelite")
     app.setFont(QFont("Bahnschrift", 10))
     app.setStyleSheet(aibox_stylesheet())
-    icon_path = resource_path("Aibox.png")
-    if icon_path.exists():
+    icon_path = app_icon_path()
+    if icon_path is not None:
         app.setWindowIcon(QIcon(str(icon_path)))
     w = MainWindow()
-    if icon_path.exists():
+    if icon_path is not None:
         w.setWindowIcon(QIcon(str(icon_path)))
     # Janela compacta: só o espaço necessário por aba
     w.setMinimumSize(900, 800)
