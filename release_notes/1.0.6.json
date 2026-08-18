@@ -1,0 +1,14 @@
+{
+  "version": "1.0.6",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-18",
+  "notes": {
+    "added": [],
+    "fixed": [
+      "Autostart: o Auto startup passa a ficar realmente em ON",
+      "Síntese de Voz: na primeira abertura espera a lista de idiomas e seleciona português (Brasil), sem navegar na tela preta"
+    ],
+    "removed": []
+  }
+}

@@ -1085,6 +1085,7 @@ class Adb:
         labels: dict[str, str] | None = None,
     ) -> AutostartConfigResult:
         """Fluxo Autostart persistente e rápido: abrir, ligar, ADD, tocar o app, BACK."""
+        import time
 
         labels = labels or {}
         skip = {
@@ -1114,9 +1115,10 @@ class Adb:
 
         notes: list[str] = []
         self._ui_dismiss_autostart_overlays(serial)
+        time.sleep(0.45)
 
         on_ok = self._ui_turn_on_autostart(serial)
-        notes.append("Auto startup=ON" if on_ok else "Auto startup: falhou ao ligar")
+        notes.append("Auto startup=ON" if on_ok else "Auto startup: ficou OFF")
 
         enabled = 0
         for pkg in targets:
@@ -1209,10 +1211,152 @@ class Adb:
 
     @staticmethod
     def _ui_autostart_is_on(xml: str) -> bool:
-        low = (xml or "").lower()
-        if 'text="on"' in low or "text='on'" in low:
-            return 'text="off"' not in low and "text='off'" not in low
-        return 'class="android.widget.togglebutton"' in low and 'checked="true"' in low
+        state, _xy = Adb._ui_autostart_startup_state(xml)
+        return state == "on"
+
+    @staticmethod
+    def _ui_node_bounds4(node) -> tuple[int, int, int, int] | None:
+        m = re.match(
+            r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", (node.get("bounds") or "").strip()
+        )
+        if not m:
+            return None
+        return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+
+    @staticmethod
+    def _ui_is_toggle_class(cls: str) -> bool:
+        c = (cls or "").lower()
+        return any(
+            k in c
+            for k in (
+                "togglebutton",
+                "widget.switch",
+                "switchcompat",
+                "checkbox",
+                "compoundbutton",
+            )
+        )
+
+    @staticmethod
+    def _ui_is_auto_startup_label(text: str) -> bool:
+        t = Adb._fold_ui_text(text)
+        compact = t.replace(" ", "").replace("-", "")
+        return "auto startup" in t or "autostartup" in compact
+
+    @staticmethod
+    def _ui_on_off_from_text(text: str) -> str | None:
+        t = Adb._fold_ui_text(text)
+        if not t:
+            return None
+        if t in ("on", "ligado"):
+            return "on"
+        if t in ("off", "desligado"):
+            return "off"
+        m = re.search(r"=\s*(on|off|ligado|desligado)\b", t)
+        if m:
+            return "on" if m.group(1) in ("on", "ligado") else "off"
+        return None
+
+    @staticmethod
+    def _ui_autostart_startup_state(
+        xml: str,
+    ) -> tuple[str | None, tuple[int, int] | None]:
+        """Localiza a linha «Auto startup» e devolve (on|off|None, ponto para toque)."""
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return None, None
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return None, None
+        parent = {child: node for node in root.iter() for child in list(node)}
+
+        def texts_of(node) -> list[str]:
+            vals = [
+                (node.get("text") or "").strip(),
+                (node.get("content-desc") or "").strip(),
+            ]
+            return [v for v in vals if v]
+
+        ranked: list[tuple[int, object]] = []
+        for n in root.iter("node"):
+            blob = " ".join(texts_of(n))
+            if not any(Adb._ui_is_auto_startup_label(t) for t in texts_of(n)):
+                continue
+            score = 2 if "auto startup" in Adb._fold_ui_text(blob) else 1
+            if Adb._ui_on_off_from_text(blob):
+                score += 3
+            ranked.append((score, n))
+        ranked.sort(key=lambda item: -item[0])
+        if not ranked:
+            return None, None
+        label = ranked[0][1]
+        lb = Adb._ui_node_bounds4(label)
+        row = parent.get(label, label)
+        if row is root:
+            row = label
+        row_b = Adb._ui_node_bounds4(row) or lb
+        state: str | None = None
+        tap: tuple[int, int] | None = None
+
+        for t in texts_of(label):
+            got = Adb._ui_on_off_from_text(t)
+            if got:
+                state = got
+                break
+
+        scan = list(row.iter("node")) if row is not None else [label]
+        for node in scan:
+            checked = (node.get("checked") or "").lower()
+            if Adb._ui_is_toggle_class(node.get("class") or "") and checked in (
+                "true",
+                "false",
+            ):
+                state = "on" if checked == "true" else "off"
+                center = Adb._bounds_center(node.get("bounds") or "")
+                if center:
+                    tap = center
+                break
+            for t in texts_of(node):
+                if Adb._fold_ui_text(t) not in ("on", "off", "ligado", "desligado"):
+                    continue
+                got = Adb._ui_on_off_from_text(t)
+                if got:
+                    state = got
+                    center = Adb._bounds_center(node.get("bounds") or "")
+                    if center:
+                        tap = center
+
+        if (state is None or tap is None) and lb is not None:
+            lx1, ly1, lx2, ly2 = lb
+            for node in root.iter("node"):
+                b = Adb._ui_node_bounds4(node)
+                if b is None or b[0] < lx2:
+                    continue
+                if b[3] < ly1 or b[1] > ly2:
+                    continue
+                checked = (node.get("checked") or "").lower()
+                if Adb._ui_is_toggle_class(node.get("class") or "") and checked in (
+                    "true",
+                    "false",
+                ):
+                    state = "on" if checked == "true" else "off"
+                    tap = Adb._bounds_center(node.get("bounds") or "") or tap
+                    break
+                for t in texts_of(node):
+                    got = Adb._ui_on_off_from_text(t)
+                    if got:
+                        state = got
+                        tap = Adb._bounds_center(node.get("bounds") or "") or tap
+
+        if tap is None:
+            box = row_b or lb
+            if box is not None:
+                x1, y1, x2, y2 = box
+                tap = (x1 + max(12, int((x2 - x1) * 0.88)), (y1 + y2) // 2)
+        return state, tap
 
     @staticmethod
     def _ui_autostart_update_dialog_open(xml: str) -> bool:
@@ -1317,11 +1461,26 @@ class Adb:
         return self._ui_tap_label_anywhere(serial, labels, prefer_left=True, xml=xml)
 
     def _ui_turn_on_autostart(self, serial: str) -> bool:
-        """Liga o ToggleButton OFF → ON (1 dump)."""
-        xml = self._dump_ui_xml(serial) or ""
-        if self._ui_autostart_is_on(xml):
-            return True
-        return self._ui_tap_label_anywhere(serial, ("OFF", "Off"), xml=xml)
+        """Liga o controle «Auto startup» e confirma no dump que ficou ON."""
+        import time
+
+        last_xml = ""
+        for _ in range(5):
+            xml = self._dump_ui_xml(serial) or last_xml
+            last_xml = xml
+            state, xy = self._ui_autostart_startup_state(xml)
+            if state == "on":
+                return True
+            if xy is not None:
+                self._tap_only(serial, xy[0], xy[1])
+            elif not self._ui_tap_label_anywhere(
+                serial, ("OFF", "Off", "Auto startup"), xml=xml
+            ):
+                self.shell_try(serial, "input keyevent 23", timeout_s=2)
+            time.sleep(0.4)
+        xml = self._dump_ui_xml(serial) or last_xml
+        state, _xy = self._ui_autostart_startup_state(xml)
+        return state == "on"
 
     def _ui_open_applications_add(self, serial: str) -> bool:
         """Abre o botão ADD da tela principal (1 dump)."""
@@ -1538,7 +1697,7 @@ class Adb:
                 )
             done.append("instalador-voz")
 
-            status("TTS: 38× baixo → português (Brasil) → espera download → 5× → Voz V.")
+            status("TTS: lista de idiomas → português (Brasil) → espera download → Voz V.")
             voice_ok, trail = self._tts_navigate_installer(serial, on_status=on_status)
             done.extend(trail)
             if voice_ok:
@@ -1746,9 +1905,10 @@ class Adb:
         )
 
     def _open_tts_voice_data_install(self, serial: str, engine: str) -> bool:
-        """Abre o instalador na lista padrão (sem extras — a contagem 38 depende disso)."""
+        """Abre o instalador e espera a lista de idiomas — não só o foco da janela preta."""
         self.shell_try(serial, f"am force-stop {engine}", timeout_s=4)
-        time.sleep(0.25)
+        time.sleep(0.3)
+        self.shell_try(serial, "input keyevent 224; svc power stayon true", timeout_s=4)
         cmds = (
             f"am start -a android.speech.tts.engine.INSTALL_TTS_DATA "
             f"-n {engine}/.local.voicepack.ui.VoiceDataInstallActivity",
@@ -1766,13 +1926,16 @@ class Adb:
                 break
         if not started:
             return False
-        self._tts_wait_installer_focused(serial, engine)
+        self._tts_wait_installer_focused(serial, engine, timeout_s=6.0)
+        self._tts_wait_voice_installer_ready(
+            serial, engine, timeout_s=self.TTS_INSTALLER_READY_WAIT_S
+        )
         return True
 
     def _tts_wait_installer_focused(
-        self, serial: str, engine: str, *, timeout_s: float = 2.5
+        self, serial: str, engine: str, *, timeout_s: float = 6.0
     ) -> None:
-        """Espera a lista ganhar foco antes dos 38 cliques (senão as teclas se perdem)."""
+        """Espera a activity ganhar foco. A lista em si vem depois (tela preta no 1º open)."""
         deadline = time.monotonic() + timeout_s
         needle = (engine or "").lower()
         while time.monotonic() < deadline:
@@ -1840,6 +2003,7 @@ class Adb:
     TTS_VOICE_V_DOWN_COUNT = 5
     TTS_PT_BR_DOWNLOAD_WAIT_S = 30
     TTS_PT_BR_DOWNLOAD_POLL_S = 30
+    TTS_INSTALLER_READY_WAIT_S = 15
     CONFIG_RETRY_ATTEMPTS = 2
 
     @staticmethod
@@ -1873,19 +2037,54 @@ class Adb:
         *,
         on_status: Callable[[str], None] | None = None,
     ) -> tuple[bool, list[str]]:
-        """38× baixo, Enter em português (Brasil); espera o download; 5× baixo, Enter em Voz V."""
+        """Espera a lista aparecer, toca português (Brasil), espera o download, marca Voz V.
+
+        Na primeira abertura o instalador fica preto/vazio: clicar 38× nessa hora
+        seleciona outro país. Só navega depois que o dump mostra a lista.
+        """
 
         def status(msg: str) -> None:
             if on_status:
                 on_status(msg)
 
         trail: list[str] = []
-        status("TTS: 38× baixo até português (Brasil)…")
-        self._tts_dpad_down(serial, self.TTS_PT_BR_DOWN_COUNT)
-        trail.append("38-down")
-        status("TTS: Enter em português (Brasil).")
-        self._tts_press_enter(serial)
-        trail.append("enter-pt-BR")
+        status("TTS: esperando a lista de idiomas abrir…")
+        self.shell_try(serial, "input keyevent 224; svc power stayon true", timeout_s=4)
+        ready = self._tts_wait_voice_installer_ready(
+            serial, "", timeout_s=self.TTS_INSTALLER_READY_WAIT_S
+        )
+        xml = self._dump_ui_xml(serial) or ""
+        screen = self._tts_classify_screen(xml)
+        trail.append(f"tela-inicial={screen}")
+        if ready:
+            trail.append("lista-pronta")
+        else:
+            trail.append("lista-lenta")
+
+        if screen in {"voices", "download", "busy"}:
+            trail.append("idioma-ja-ok")
+        else:
+            picked, extra = self._tts_select_portuguese_brazil(serial, xml, status)
+            trail.extend(extra)
+            if not picked:
+                xml = self._dump_ui_xml(serial) or ""
+                screen = self._tts_classify_screen(xml)
+                if screen in {"language", "country"} or not (xml or "").strip():
+                    status("TTS: 38× baixo até português (Brasil)…")
+                    self._tts_dpad_down(serial, self.TTS_PT_BR_DOWN_COUNT)
+                    trail.append("38-down")
+                    confirmed, extra2 = self._tts_confirm_pt_br_after_scroll(
+                        serial, status
+                    )
+                    trail.extend(extra2)
+                    if not confirmed:
+                        status("TTS: Enter em português (Brasil).")
+                        self._tts_press_enter(serial)
+                        trail.append("enter-pt-BR")
+                else:
+                    trail.append("nao-selecionou-pt-BR")
+                    return False, trail
+
         status(
             f"TTS: aguardando download de português (Brasil) "
             f"({self.TTS_PT_BR_DOWNLOAD_WAIT_S}s)…"
@@ -1940,6 +2139,152 @@ class Adb:
         status("TTS: sequência enviada, mas a tela não mostrou Voz V.")
         return False, trail
 
+    def _tts_select_portuguese_brazil(
+        self,
+        serial: str,
+        xml: str = "",
+        on_status: Callable[[str], None] | None = None,
+    ) -> tuple[bool, list[str]]:
+        """Toca português (Brasil) ou Brasil no dump visível. Sem DPAD cego."""
+
+        def note(msg: str) -> None:
+            if on_status:
+                on_status(msg)
+
+        current = xml or self._dump_ui_xml(serial) or ""
+        screen = self._tts_classify_screen(current)
+        if screen == "country":
+            note("TTS: tela de país — tocando Brasil.")
+            if self._tts_click_country_brazil(serial, current):
+                time.sleep(0.35)
+                return True, ["tap-brasil"]
+            return False, ["pais-sem-brasil"]
+        if screen != "language":
+            return False, [f"tela={screen}"]
+
+        if self._tts_click_portuguese_brazil(serial, current):
+            note("TTS: toquei português (Brasil).")
+            trail = ["tap-pt-BR"]
+            current = self._wait_ui_change(serial, current, timeout_s=2.5) or (
+                self._dump_ui_xml(serial) or current
+            )
+            if self._tts_classify_screen(current) == "country":
+                note("TTS: agora o país — tocando Brasil.")
+                if self._tts_click_country_brazil(serial, current):
+                    trail.append("tap-brasil")
+                    time.sleep(0.3)
+            return True, trail
+
+        note("TTS: português (Brasil) fora da tela — buscando na lista…")
+        self._tts_jump_to_portuguese_brazil(serial, current)
+        time.sleep(0.4)
+        current = self._dump_ui_xml(serial) or ""
+        trail = ["busca"]
+        if self._tts_click_portuguese_brazil(serial, current):
+            note("TTS: toquei português (Brasil).")
+            trail.append("tap-pt-BR")
+            current = self._wait_ui_change(serial, current, timeout_s=2.5) or current
+            if self._tts_classify_screen(current) == "country":
+                if self._tts_click_country_brazil(serial, current):
+                    trail.append("tap-brasil")
+            return True, trail
+        if self._tts_classify_screen(current) == "country":
+            if self._tts_click_country_brazil(serial, current):
+                note("TTS: toquei Brasil.")
+                return True, trail + ["tap-brasil"]
+        return False, trail + ["sem-pt-BR-visivel"]
+
+    def _tts_confirm_pt_br_after_scroll(
+        self,
+        serial: str,
+        on_status: Callable[[str], None] | None = None,
+    ) -> tuple[bool, list[str]]:
+        """Depois dos 38 downs: toca o item certo se o dump mostrar; não Enter em outro país."""
+        xml = self._dump_ui_xml(serial) or ""
+        screen = self._tts_classify_screen(xml)
+        if screen == "country":
+            if on_status:
+                on_status("TTS: lista parou no país — tocando Brasil.")
+            if self._tts_click_country_brazil(serial, xml):
+                time.sleep(0.3)
+                return True, ["tap-brasil"]
+            return False, ["pais-sem-brasil"]
+        if self._tts_find_pt_br_center(xml):
+            if self._tts_click_portuguese_brazil(serial, xml):
+                if on_status:
+                    on_status("TTS: toquei português (Brasil).")
+                current = self._wait_ui_change(serial, xml, timeout_s=2.5) or xml
+                extra = ["tap-pt-BR"]
+                if self._tts_classify_screen(current) == "country":
+                    if self._tts_click_country_brazil(serial, current):
+                        extra.append("tap-brasil")
+                return True, extra
+        if screen == "language" and Adb._tts_is_portuguese_brazil(xml):
+            if on_status:
+                on_status("TTS: Enter em português (Brasil).")
+            self._tts_press_enter(serial)
+            return True, ["enter-pt-BR"]
+        if not (xml or "").strip():
+            if on_status:
+                on_status("TTS: sem dump da lista — Enter.")
+            self._tts_press_enter(serial)
+            return True, ["enter-sem-dump"]
+        picked, extra = self._tts_select_portuguese_brazil(serial, xml, on_status)
+        return picked, extra
+
+    def _tts_click_country_brazil(self, serial: str, xml: str) -> bool:
+        pos = self._tts_find_country_brazil_center(xml)
+        if pos is None:
+            return False
+        return self._tap_only(serial, pos[0], pos[1])
+
+    @staticmethod
+    def _tts_is_country_brazil_label(text: str) -> bool:
+        folded = Adb._fold_ui_text(text)
+        if any(k in folded for k in ("portugal", "portugues", "portuguese")):
+            return False
+        return folded in {"brasil", "brazil"}
+
+    @staticmethod
+    def _tts_find_country_brazil_center(xml: str) -> tuple[int, int] | None:
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return None
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return None
+        screen_w, screen_h = Adb._hierarchy_size(xml)
+        hits: list[tuple[int, int, int]] = []
+        for node in root.iter("node"):
+            own = (node.get("text") or "").strip()
+            desc = (node.get("content-desc") or "").strip()
+            if not (
+                Adb._tts_is_country_brazil_label(own)
+                or Adb._tts_is_country_brazil_label(desc)
+            ):
+                continue
+            center = Adb._bounds_center(node.get("bounds") or "")
+            if center is None:
+                continue
+            m = re.match(
+                r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", (node.get("bounds") or "").strip()
+            )
+            if not m:
+                continue
+            x1, y1, x2, y2 = map(int, m.groups())
+            w, h = x2 - x1, y2 - y1
+            if Adb._node_is_full_screen(w, h, screen_w, screen_h):
+                continue
+            hits.append((w * h, center[0], center[1]))
+        if not hits:
+            return None
+        hits.sort(key=lambda t: t[0])
+        _, x, y = hits[0]
+        return x, y
+
     @staticmethod
     def _tts_screen_label(screen: str) -> str:
         return {
@@ -1953,10 +2298,14 @@ class Adb:
 
     @staticmethod
     def _tts_classify_screen(xml: str) -> str:
-        """Classifica a tela do instalador Google TTS."""
-        if Adb.xml_tts_busy(xml):
-            return "busy"
+        """Classifica a tela do instalador Google TTS.
+
+        Splash preta / «Loading» sem lista de idiomas NÃO conta como tela pronta
+        (antes isso virava «busy» e a navegação começava no escuro).
+        """
         if Adb.xml_has_voice_list(xml) or Adb.xml_voice_v_selected(xml):
+            if Adb.xml_tts_busy(xml):
+                return "busy"
             return "voices"
         if Adb.xml_is_country_picker(xml):
             return "country"
@@ -1969,7 +2318,7 @@ class Adb:
                 "instalar dados de voz",
             )
         ) and "voz v" not in low:
-            return "download"
+            return "busy" if Adb.xml_tts_busy(xml) else "download"
         if Adb.xml_has_language_list(xml):
             return "language"
         if any(k in low for k in ("portug", "idioma", "language", "english", "espa")):
@@ -2308,19 +2657,24 @@ class Adb:
         return ok or any(s in {"country", "voices", "voz-v-ok"} for s in trail)
 
     def _tts_wait_voice_installer_ready(
-        self, serial: str, engine: str, *, timeout_s: float = 8.0
+        self, serial: str, engine: str, *, timeout_s: float = 15.0
     ) -> bool:
-        """Espera a lista do instalador de voz aparecer de verdade."""
+        """Espera a lista de idiomas — não a splash preta nem o foco vazio."""
         _ = engine
-        deadline = time.monotonic() + timeout_s
+        deadline = time.monotonic() + max(2.0, float(timeout_s))
+        started = time.monotonic()
+        woke = False
         while time.monotonic() < deadline:
             xml = self._dump_ui_xml(serial) or ""
             screen = self._tts_classify_screen(xml)
             if screen in {"language", "country", "voices", "download"}:
                 return True
-            if engine and self._package_is_focused(serial, engine) and xml.strip().startswith("<"):
-                return True
-            time.sleep(0.2)
+            if not woke and (time.monotonic() - started) >= 2.5:
+                self.shell_try(
+                    serial, "input keyevent 224; svc power stayon true", timeout_s=3
+                )
+                woke = True
+            time.sleep(0.25)
         return False
 
     def _current_focus_line(self, serial: str) -> str:

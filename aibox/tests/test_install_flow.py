@@ -87,6 +87,56 @@ class TestInstallProgress(unittest.TestCase):
         self.assertIn("2ª", result.message)
 
 
+class TestAutostartXml(unittest.TestCase):
+    def test_auto_startup_off_toggle_is_detected(self) -> None:
+        xml = """
+        <hierarchy>
+          <node bounds="[0,80][1920,200]">
+            <node text="Auto startup" bounds="[40,90][600,180]"/>
+            <node class="android.widget.ToggleButton" text="OFF" checked="false"
+                  bounds="[1500,100][1860,170]"/>
+          </node>
+        </hierarchy>
+        """
+        self.assertFalse(Adb._ui_autostart_is_on(xml))
+        state, xy = Adb._ui_autostart_startup_state(xml)
+        self.assertEqual(state, "off")
+        self.assertIsNotNone(xy)
+        self.assertGreater(xy[0], 1400)
+
+    def test_auto_startup_equals_off_text(self) -> None:
+        xml = """
+        <hierarchy>
+          <node text="Auto startup =  OFF" bounds="[0,80][1920,160]"/>
+        </hierarchy>
+        """
+        state, xy = Adb._ui_autostart_startup_state(xml)
+        self.assertEqual(state, "off")
+        self.assertIsNotNone(xy)
+
+    def test_auto_startup_on_toggle_is_detected(self) -> None:
+        xml = """
+        <hierarchy>
+          <node bounds="[0,80][1920,200]">
+            <node text="Auto startup" bounds="[40,90][600,180]"/>
+            <node class="android.widget.ToggleButton" text="ON" checked="true"
+                  bounds="[1500,100][1860,170]"/>
+          </node>
+        </hierarchy>
+        """
+        self.assertTrue(Adb._ui_autostart_is_on(xml))
+
+    def test_unrelated_checked_toggle_is_not_auto_startup(self) -> None:
+        xml = """
+        <hierarchy>
+          <node class="android.widget.ToggleButton" text="Wifi" checked="true"
+                bounds="[10,10][80,40]"/>
+          <node text="Auto startup" bounds="[40,90][600,180]"/>
+        </hierarchy>
+        """
+        self.assertFalse(Adb._ui_autostart_is_on(xml))
+
+
 class TestVoiceVXml(unittest.TestCase):
     def test_voice_v_checked_is_selected(self) -> None:
         xml = """
@@ -199,6 +249,7 @@ class TestVoiceVXml(unittest.TestCase):
         self.assertEqual(Adb.TTS_VOICE_V_DOWN_COUNT, 5)
         self.assertEqual(Adb.TTS_PT_BR_DOWNLOAD_WAIT_S, 30)
         self.assertEqual(Adb.TTS_PT_BR_DOWNLOAD_POLL_S, 30)
+        self.assertEqual(Adb.TTS_INSTALLER_READY_WAIT_S, 15)
         self.assertEqual(Adb.CONFIG_RETRY_ATTEMPTS, 2)
         cmd38 = Adb._tts_keyevent_cmd(38, enter=False)
         self.assertTrue(cmd38.startswith("input keyevent "))
@@ -210,6 +261,97 @@ class TestVoiceVXml(unittest.TestCase):
     def test_voice_list_detects_voz_v(self) -> None:
         self.assertTrue(Adb.xml_has_voice_list('<node text="Voz V"/>'))
         self.assertFalse(Adb.xml_has_voice_list('<node text="Português"/>'))
+
+    def test_loading_splash_is_not_ready_installer(self) -> None:
+        self.assertEqual(Adb._tts_classify_screen('<node text="Loading"/>'), "unknown")
+        self.assertEqual(Adb._tts_classify_screen('<node text="Carregando"/>'), "unknown")
+        self.assertEqual(Adb._tts_classify_screen("<hierarchy></hierarchy>"), "unknown")
+        self.assertTrue(Adb.xml_tts_busy('<node text="Loading"/>'))
+
+    def test_country_brazil_center_ignores_portugal_and_language_row(self) -> None:
+        country = (
+            '<hierarchy bounds="[0,0][1920,1080]">'
+            '<node text="Portugal" bounds="[0,200][1920,280]"/>'
+            '<node text="Brasil" bounds="[0,300][1920,380]"/>'
+            "</hierarchy>"
+        )
+        self.assertEqual(Adb._tts_find_country_brazil_center(country), (960, 340))
+        self.assertTrue(Adb._tts_is_country_brazil_label("Brasil"))
+        self.assertTrue(Adb._tts_is_country_brazil_label("Brazil"))
+        self.assertFalse(Adb._tts_is_country_brazil_label("português (Brasil)"))
+        self.assertFalse(Adb._tts_is_country_brazil_label("Portugal"))
+        language = (
+            '<hierarchy bounds="[0,0][1920,1080]">'
+            '<node text="português (Brasil)" bounds="[80,300][1840,380]"/>'
+            "</hierarchy>"
+        )
+        self.assertIsNone(Adb._tts_find_country_brazil_center(language))
+
+    def test_wait_ready_skips_splash_until_language_list(self) -> None:
+        screens = [
+            "",
+            "<hierarchy></hierarchy>",
+            '<node text="Loading"/>',
+            (
+                '<node text="English"/><node text="Español"/>'
+                '<node text="Português (Brasil)"/>'
+            ),
+        ]
+        step = {"n": 0}
+        adb = Adb.__new__(Adb)
+
+        def dump(_serial: str) -> str:
+            xml = screens[min(step["n"], len(screens) - 1)]
+            step["n"] += 1
+            return xml
+
+        adb._dump_ui_xml = dump  # type: ignore[method-assign]
+        adb.shell_try = lambda *_a, **_k: None  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            ok = Adb._tts_wait_voice_installer_ready(
+                adb, "serial", "com.google.android.tts", timeout_s=5
+            )
+        self.assertTrue(ok)
+        self.assertGreaterEqual(step["n"], 4)
+
+    def test_navigate_taps_visible_pt_br_without_blind_dpad(self) -> None:
+        language = (
+            '<hierarchy bounds="[0,0][1920,1080]">'
+            '<node text="English" bounds="[0,200][1920,280]"/>'
+            '<node text="Español" bounds="[0,280][1920,360]"/>'
+            '<node text="português (Brasil)" bounds="[80,400][1840,480]"/>'
+            "</hierarchy>"
+        )
+        voices = (
+            '<hierarchy bounds="[0,0][1920,1080]">'
+            '<node text="Voz V" checked="true" bounds="[0,200][1920,280]"/>'
+            "</hierarchy>"
+        )
+        adb = Adb.__new__(Adb)
+        taps: list[tuple[int, int]] = []
+        downs: list[object] = []
+        dumps = {"n": 0}
+
+        def dump(_serial: str) -> str:
+            dumps["n"] += 1
+            return language if dumps["n"] == 1 else voices
+
+        adb._tts_wait_voice_installer_ready = lambda *_a, **_k: True  # type: ignore[method-assign]
+        adb._dump_ui_xml = dump  # type: ignore[method-assign]
+        adb.shell_try = lambda *_a, **_k: "ok"  # type: ignore[method-assign]
+        adb._tts_dpad_down = lambda _s, n: downs.append(n)  # type: ignore[method-assign]
+        adb._tts_press_enter = lambda *_a, **_k: downs.append("enter")  # type: ignore[method-assign]
+        adb._tap_only = (  # type: ignore[method-assign]
+            lambda _s, x, y: taps.append((x, y)) or True
+        )
+        adb._wait_ui_change = lambda *_a, **_k: voices  # type: ignore[method-assign]
+        adb._tts_select_voice_v_now = lambda *_a, **_k: True  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            ok, trail = Adb._tts_navigate_installer(adb, "serial")
+        self.assertTrue(ok)
+        self.assertIn("tap-pt-BR", trail)
+        self.assertNotIn(38, downs)
+        self.assertTrue(taps)
 
 
 class TestFocusParse(unittest.TestCase):
