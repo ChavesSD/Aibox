@@ -376,8 +376,8 @@ def launch_update_helper(
     args = helper_argv(pid=pid, install_dir=install_dir, package=package, restart=restart)
     creationflags = 0
     if sys.platform == "win32":
-        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-        creationflags = 0x00000008 | 0x00000200
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        creationflags = 0x00000008 | 0x00000200 | 0x08000000
     subprocess.Popen(
         args,
         cwd=str(package.parent),

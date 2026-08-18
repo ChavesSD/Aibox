@@ -249,6 +249,31 @@ class TestChecksumAndExtract(unittest.TestCase):
             self.assertEqual((install / "Aibox.exe").read_bytes(), b"new-exe")
             self.assertFalse(new_dir.exists())
 
+    def test_swap_script_is_vbs_without_find_console(self) -> None:
+        from aibox.update_helper import _write_swap_script
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install = root / "Aibox"
+            new_dir = root / "Aibox.new"
+            install.mkdir()
+            new_dir.mkdir()
+            script = _write_swap_script(
+                install_dir=install,
+                new_dir=new_dir,
+                helper_pid=38428,
+                restart=True,
+                script_dir=root,
+            )
+            text = script.read_text(encoding="ascii")
+            self.assertEqual(script.suffix, ".vbs")
+            self.assertIn("Win32_Process", text)
+            self.assertIn("38428", text)
+            self.assertNotIn("find ", text.lower())
+            self.assertNotIn("tasklist", text.lower())
+            self.assertNotIn("cmd.exe", text.lower())
+            self.assertIn("WScript.Sleep", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -143,6 +143,10 @@ def _extract_onedir(package: Path, install_dir: Path) -> None:
     apply_onedir_swap(install_dir, new_dir)
 
 
+def _vbs_quote(value: str) -> str:
+    return '"' + str(value).replace('"', '""') + '"'
+
+
 def _write_swap_script(
     *,
     install_dir: Path,
@@ -151,61 +155,105 @@ def _write_swap_script(
     restart: bool,
     script_dir: Path,
 ) -> Path:
+    """Gera um .vbs (wscript, sem console).
+
+    O .cmd antigo fazia `tasklist | find "PID"`: o find.exe abre uma janela
+    a cada segundo e, se o helper ainda não saiu, parece que «nunca fecha».
+    """
     script_dir.mkdir(parents=True, exist_ok=True)
-    script = script_dir / f"aibox-swap-{helper_pid}.cmd"
-    install = str(install_dir)
-    newp = str(new_dir)
-    backup = str(install_dir.parent / f"{install_dir.name}.bak-{helper_pid}")
-    exe = str(install_dir / "Aibox.exe")
-    log = str(script_dir / "aibox-swap.log")
-    restart_line = f'start "" "{exe}"' if restart else "rem no restart"
+    script = script_dir / f"aibox-swap-{helper_pid}.vbs"
+    install_q = _vbs_quote(str(install_dir))
+    new_q = _vbs_quote(str(new_dir))
+    backup_q = _vbs_quote(str(install_dir.parent / f"{install_dir.name}.bak-{helper_pid}"))
+    exe_q = _vbs_quote(str(install_dir / "Aibox.exe"))
+    log_q = _vbs_quote(str(script_dir / "aibox-swap.log"))
+    pid = int(helper_pid)
+    restart_block = (
+        f"sh.Run {exe_q}, 1, False"
+        if restart
+        else "' no restart"
+    )
     script.write_text(
         "\r\n".join(
             [
-                "@echo off",
-                "setlocal",
-                f'echo swap-start>> "{log}"',
-                ":wait",
-                "timeout /t 1 /nobreak >nul",
-                f'tasklist /FI "PID eq {helper_pid}" /NH | find "{helper_pid}" >nul',
-                "if not errorlevel 1 goto wait",
-                "taskkill /F /IM adb.exe /T >nul 2>&1",
-                "timeout /t 2 /nobreak >nul",
-                "set /a N=0",
-                ":retry",
-                "set /a N+=1",
-                f'if exist "{install}" move /Y "{install}" "{backup}" >nul 2>&1',
-                f'if exist "{install}" (',
-                "  if %N% LSS 25 (",
-                "    timeout /t 1 /nobreak >nul",
-                "    goto retry",
-                "  )",
-                f'  echo FAIL-rename>> "{log}"',
-                "  exit /b 1",
-                ")",
-                f'move /Y "{newp}" "{install}" >nul 2>&1',
-                f'if not exist "{exe}" (',
-                f'  if exist "{backup}" move /Y "{backup}" "{install}" >nul 2>&1',
-                f'  echo FAIL-move>> "{log}"',
-                "  exit /b 1",
-                ")",
-                restart_line,
-                f'rmdir /s /q "{backup}" >nul 2>&1',
-                f'echo swap-ok>> "{log}"',
-                'del "%~f0" >nul 2>&1',
-                "exit /b 0",
+                "Option Explicit",
+                "Dim sh, fso, svc, col, n, i, logPath, ts",
+                "Set sh = CreateObject(\"WScript.Shell\")",
+                "Set fso = CreateObject(\"Scripting.FileSystemObject\")",
+                f"logPath = {log_q}",
+                "Sub LogLine(msg)",
+                "  On Error Resume Next",
+                "  Set ts = fso.OpenTextFile(logPath, 8, True)",
+                "  ts.WriteLine Now & \" \" & msg",
+                "  ts.Close",
+                "  On Error GoTo 0",
+                "End Sub",
+                "Function PidAlive(pid)",
+                "  PidAlive = False",
+                "  On Error Resume Next",
+                "  Set svc = GetObject(\"winmgmts:\\\\.\\root\\cimv2\")",
+                '  Set col = svc.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE ProcessId=" & pid)',
+                "  If Err.Number = 0 Then PidAlive = (col.Count > 0)",
+                "  On Error GoTo 0",
+                "End Function",
+                'LogLine "swap-start"',
+                "i = 0",
+                f"Do While PidAlive({pid})",
+                "  i = i + 1",
+                "  If i > 225 Then Exit Do",
+                "  WScript.Sleep 400",
+                "Loop",
+                "WScript.Sleep 800",
+                'sh.Run "taskkill /F /IM adb.exe /T", 0, True',
+                "WScript.Sleep 1500",
+                "n = 0",
+                "Do",
+                "  n = n + 1",
+                f"  If fso.FolderExists({install_q}) Then",
+                "    On Error Resume Next",
+                f"    fso.MoveFolder {install_q}, {backup_q}",
+                "    On Error GoTo 0",
+                "  End If",
+                f"  If Not fso.FolderExists({install_q}) Then Exit Do",
+                "  If n >= 25 Then",
+                '    LogLine "FAIL-rename"',
+                "    WScript.Quit 1",
+                "  End If",
+                "  WScript.Sleep 1000",
+                "Loop",
+                "On Error Resume Next",
+                f"fso.MoveFolder {new_q}, {install_q}",
+                "On Error GoTo 0",
+                f"If Not fso.FileExists({exe_q}) Then",
+                f"  If fso.FolderExists({backup_q}) Then fso.MoveFolder {backup_q}, {install_q}",
+                '  LogLine "FAIL-move"',
+                "  WScript.Quit 1",
+                "End If",
+                restart_block,
+                f"If fso.FolderExists({backup_q}) Then",
+                "  On Error Resume Next",
+                f"  fso.DeleteFolder {backup_q}, True",
+                "  On Error GoTo 0",
+                "End If",
+                'LogLine "swap-ok"',
+                "On Error Resume Next",
+                "fso.DeleteFile WScript.ScriptFullName, True",
+                "WScript.Quit 0",
                 "",
             ]
         ),
-        encoding="utf-8",
+        encoding="ascii",
+        errors="replace",
     )
     return script
 
 
 def _spawn_swap_script(script: Path) -> None:
     if sys.platform == "win32":
+        windir = os.environ.get("SystemRoot") or r"C:\Windows"
+        wscript = str(Path(windir) / "System32" / "wscript.exe")
         subprocess.Popen(
-            ["cmd.exe", "/c", str(script)],
+            [wscript, "//B", "//Nologo", str(script)],
             cwd=str(script.parent),
             close_fds=True,
             creationflags=_DETACHED,
