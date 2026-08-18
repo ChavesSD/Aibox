@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
-from aibox.adb import Adb, TtsConfigResult
+from aibox.adb import Adb, AutostartConfigResult, TtsConfigResult
 from aibox.apks_catalog import APK_CATALOG, ApkEntry
 from aibox.main_window import (
     expand_install_dependencies,
@@ -48,6 +49,42 @@ class TestInstallProgress(unittest.TestCase):
             message="ok",
         )
         self.assertTrue(ok.ok)
+
+    def test_tts_retries_when_first_attempt_misses_voice_v(self) -> None:
+        adb = Adb.__new__(Adb)
+        calls = {"n": 0}
+        fail = TtsConfigResult(False, False, "parcial")
+        ok = TtsConfigResult(True, True, "ok")
+
+        def once(*_a, **_k):
+            calls["n"] += 1
+            return fail if calls["n"] == 1 else ok
+
+        adb._configure_tts_pt_br_voice_v_once = once  # type: ignore[method-assign]
+        adb.close_settings_and_tts_ui = lambda *_a, **_k: None  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            result = Adb.configure_tts_pt_br_voice_v(adb, "serial")
+        self.assertEqual(calls["n"], 2)
+        self.assertTrue(result.voice_v_confirmed)
+        self.assertIn("2ª", result.message)
+
+    def test_autostart_retries_when_first_attempt_fails(self) -> None:
+        adb = Adb.__new__(Adb)
+        calls = {"n": 0}
+
+        def once(*_a, **_k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return AutostartConfigResult(ok=False, message="falhou")
+            return AutostartConfigResult(ok=True, message="ok")
+
+        adb._configure_boot_autostart_once = once  # type: ignore[method-assign]
+        adb.close_settings_and_tts_ui = lambda *_a, **_k: None  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            result = Adb.configure_boot_autostart(adb, "serial", ["com.example.app"])
+        self.assertEqual(calls["n"], 2)
+        self.assertTrue(result.ok)
+        self.assertIn("2ª", result.message)
 
 
 class TestVoiceVXml(unittest.TestCase):
@@ -161,6 +198,8 @@ class TestVoiceVXml(unittest.TestCase):
         self.assertEqual(Adb.TTS_PT_BR_DOWN_COUNT, 38)
         self.assertEqual(Adb.TTS_VOICE_V_DOWN_COUNT, 5)
         self.assertEqual(Adb.TTS_PT_BR_DOWNLOAD_WAIT_S, 30)
+        self.assertEqual(Adb.TTS_PT_BR_DOWNLOAD_POLL_S, 30)
+        self.assertEqual(Adb.CONFIG_RETRY_ATTEMPTS, 2)
         cmd38 = Adb._tts_keyevent_cmd(38, enter=False)
         self.assertTrue(cmd38.startswith("input keyevent "))
         self.assertEqual(cmd38.split().count("20"), 38)

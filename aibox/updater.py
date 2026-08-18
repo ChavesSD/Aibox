@@ -380,7 +380,7 @@ def launch_update_helper(
         creationflags = 0x00000008 | 0x00000200
     subprocess.Popen(
         args,
-        cwd=str(install_dir),
+        cwd=str(package.parent),
         close_fds=True,
         creationflags=creationflags,
         stdin=subprocess.DEVNULL,

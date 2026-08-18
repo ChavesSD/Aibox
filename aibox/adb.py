@@ -929,7 +929,37 @@ class Adb:
         """Configura os APKs instalados para iniciar no boot.
 
         Só deve ser chamado depois da Voz V confirmada, se a fila tiver TTS.
+        Se a primeira tentativa falhar, tenta de novo.
         """
+        last = AutostartConfigResult(ok=False, message="Autoinício: não executado.")
+        attempts = max(1, int(self.CONFIG_RETRY_ATTEMPTS))
+        for attempt in range(attempts):
+            if attempt > 0:
+                self.close_settings_and_tts_ui(serial, stop_tts_engine=False)
+                time.sleep(1.8)
+            last = self._configure_boot_autostart_once(
+                serial,
+                packages,
+                labels=labels,
+                manage_display=manage_display,
+            )
+            if last.ok:
+                if attempt > 0:
+                    return AutostartConfigResult(
+                        ok=True,
+                        message=last.message + "\n(2ª tentativa de AutoStart.)",
+                    )
+                return last
+        return last
+
+    def _configure_boot_autostart_once(
+        self,
+        serial: str,
+        packages: list[str],
+        *,
+        labels: dict[str, str] | None = None,
+        manage_display: bool = True,
+    ) -> AutostartConfigResult:
         labels = labels or {}
         pkgs = []
         seen: set[str] = set()
@@ -1413,9 +1443,49 @@ class Adb:
         manage_display: bool = True,
         on_status: Callable[[str], None] | None = None,
     ) -> TtsConfigResult:
-        """Configura Síntese de Voz com sequência fixa: 38× baixo + Enter,
-        depois 5× baixo + Enter em Voz V. Sem dump no meio do caminho.
+        """Configura Síntese de Voz: 38× baixo + Enter, espera download, 5× + Enter em Voz V.
+
+        Se a Voz V não for confirmada, faz uma segunda tentativa completa.
         """
+
+        def status(msg: str) -> None:
+            if on_status:
+                on_status(msg)
+
+        last = TtsConfigResult(
+            voice_v_confirmed=False,
+            engine_locale_ok=False,
+            message="Pós-config TTS: não executado.",
+        )
+        attempts = max(1, int(self.CONFIG_RETRY_ATTEMPTS))
+        for attempt in range(attempts):
+            if attempt > 0:
+                status("TTS: Voz V não confirmada. Segunda tentativa…")
+                self.close_settings_and_tts_ui(serial, stop_tts_engine=False)
+                time.sleep(2.0)
+            last = self._configure_tts_pt_br_voice_v_once(
+                serial,
+                manage_display=manage_display,
+                on_status=on_status,
+            )
+            if last.voice_v_confirmed:
+                if attempt > 0:
+                    return TtsConfigResult(
+                        voice_v_confirmed=True,
+                        engine_locale_ok=last.engine_locale_ok,
+                        message=last.message + " (2ª tentativa.)",
+                    )
+                return last
+        return last
+
+    def _configure_tts_pt_br_voice_v_once(
+        self,
+        serial: str,
+        *,
+        manage_display: bool = True,
+        on_status: Callable[[str], None] | None = None,
+    ) -> TtsConfigResult:
+        """Uma passagem da sequência fixa: 38× baixo + Enter, depois 5× baixo + Enter em Voz V."""
 
         def status(msg: str) -> None:
             if on_status:
@@ -1769,6 +1839,8 @@ class Adb:
     TTS_PT_BR_DOWN_COUNT = 38
     TTS_VOICE_V_DOWN_COUNT = 5
     TTS_PT_BR_DOWNLOAD_WAIT_S = 30
+    TTS_PT_BR_DOWNLOAD_POLL_S = 30
+    CONFIG_RETRY_ATTEMPTS = 2
 
     @staticmethod
     def _tts_keyevent_cmd(downs: int, *, enter: bool = False) -> str:
@@ -1820,6 +1892,32 @@ class Adb:
         )
         time.sleep(self.TTS_PT_BR_DOWNLOAD_WAIT_S)
         trail.append(f"wait-{self.TTS_PT_BR_DOWNLOAD_WAIT_S}s")
+
+        status("TTS: conferindo se o download da voz terminou…")
+        poll_deadline = time.monotonic() + max(0.0, float(self.TTS_PT_BR_DOWNLOAD_POLL_S))
+        xml = ""
+        while True:
+            xml = self._dump_ui_xml(serial) or ""
+            if self.xml_voice_v_selected(xml) or self._tts_find_voice_v_center(xml):
+                trail.append("voz-v-na-tela")
+                break
+            if self.xml_has_voice_list(xml) and not self.xml_tts_busy(xml):
+                trail.append("lista-vozes")
+                break
+            if time.monotonic() >= poll_deadline:
+                trail.append("poll-timeout")
+                break
+            screen = self._tts_classify_screen(xml)
+            if screen in ("busy", "download") or self.xml_tts_busy(xml):
+                status("TTS: voz ainda baixando, aguardando…")
+            time.sleep(2.5)
+
+        if xml and (
+            self.xml_voice_v_selected(xml) or self._tts_find_voice_v_center(xml)
+        ):
+            if self._tts_select_voice_v_now(serial, xml, status):
+                status("TTS: Voz V marcada.")
+                return True, trail + ["voz-v-ok"]
 
         status("TTS: 5× baixo até Voz V…")
         self._tts_dpad_down(serial, self.TTS_VOICE_V_DOWN_COUNT)

@@ -226,6 +226,29 @@ class TestChecksumAndExtract(unittest.TestCase):
             self.assertEqual((install / "Aibox.exe").read_bytes(), b"fake-exe")
             self.assertTrue((install / "_internal" / "x.txt").exists())
 
+    def test_stage_new_onedir_keeps_live_install(self) -> None:
+        from aibox.update_helper import apply_onedir_swap, stage_new_onedir
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            payload = root / "payload"
+            payload.mkdir()
+            (payload / "Aibox.exe").write_bytes(b"new-exe")
+            zpath = root / "pkg.zip"
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.write(payload / "Aibox.exe", arcname="Aibox/Aibox.exe")
+
+            install = root / "Aibox"
+            install.mkdir()
+            (install / "Aibox.exe").write_bytes(b"old-exe")
+
+            new_dir = stage_new_onedir(zpath, install)
+            self.assertEqual((install / "Aibox.exe").read_bytes(), b"old-exe")
+            self.assertEqual((new_dir / "Aibox.exe").read_bytes(), b"new-exe")
+            apply_onedir_swap(install, new_dir)
+            self.assertEqual((install / "Aibox.exe").read_bytes(), b"new-exe")
+            self.assertFalse(new_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 APP_NAME = "Aibox"
 APP_DIR_NAME = "Aibox"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 # Manifestos no repositório de releases (fonte + instalador + APKs).
 # Sobrescreva com AIBOX_UPDATE_MANIFEST_URL / AIBOX_APKS_MANIFEST_URL.

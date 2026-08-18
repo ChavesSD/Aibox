@@ -1,0 +1,16 @@
+{
+  "version": "1.0.5",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-08-18",
+  "notes": {
+    "added": [
+      "Segunda tentativa automática da Síntese de Voz e do Autostart se a primeira falhar"
+    ],
+    "fixed": [
+      "Atualização in-app: o app volta a abrir na versão nova após o reinício",
+      "Síntese de Voz: espera extra se a voz ainda estiver baixando antes de selecionar a Voz V"
+    ],
+    "removed": []
+  }
+}
