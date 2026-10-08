@@ -899,6 +899,7 @@ class Adb:
             parts.append("am force-stop com.google.android.tts")
         if go_home:
             parts.append("input keyevent 3")
+        parts.append("rm -f /sdcard/aibox_ui.xml")  # dump temporário do uiautomator
         self.shell_try(serial, "; ".join(parts), timeout_s=5)
 
     @staticmethod
@@ -1130,9 +1131,11 @@ class Adb:
         notes.append("Auto startup=ON" if on_ok else "Auto startup: ficou OFF")
 
         enabled = 0
+        search_by_pkg: dict[str, tuple[str, ...]] = {}
         for pkg in targets:
             nice = (labels.get(pkg) or "").strip()
             search = self._autostart_app_search_labels(pkg, nice)
+            search_by_pkg[pkg] = search
 
             if not self._ui_open_applications_add(serial):
                 notes.append(f"ADD falhou ({nice or pkg})")
@@ -1145,8 +1148,28 @@ class Adb:
                 notes.append(f"não achou na lista: {nice or pkg}")
 
         notes.append(f"apps na lista: {enabled}/{len(targets)}")
-        self.shell_try(serial, "input keyevent 4; input keyevent 4", timeout_s=3)
         apps_ok = enabled >= len(targets) if targets else True
+        if targets and enabled:
+            # Conferência na tela principal: só reprova se ela estiver visível E o app não aparecer.
+            verify_xml = (self._dump_ui_xml(serial) or "").lower()
+            if "auto startup" in verify_xml or "applications" in verify_xml:
+                absent = [
+                    labels.get(p) or p
+                    for p in targets
+                    if not any(
+                        (lab or "").strip().lower() in verify_xml
+                        for lab in search_by_pkg.get(p, ())
+                        if (lab or "").strip()
+                    )
+                ]
+                if absent:
+                    apps_ok = False
+                    notes.append("não confirmado na lista: " + ", ".join(absent))
+                else:
+                    notes.append("conferido na tela")
+            else:
+                notes.append("conferência indisponível (tela principal não visível)")
+        self.shell_try(serial, "input keyevent 4; input keyevent 4", timeout_s=3)
         ok = bool(on_ok and apps_ok)
         if not ok:
             notes.append("validação: incompleta")
@@ -1178,7 +1201,9 @@ class Adb:
                 f"monkey -p {auto_pkg} -c android.intent.category.LAUNCHER 1",
                 timeout_s=5,
             )
-            ok = "events injected" in (out or "").lower() or "starting" in (out or "").lower()
+            low_out = (out or "").lower()
+            # "Events injected: 0" é falha (monkey abortado): só vale com ao menos 1 evento.
+            ok = re.search(r"events injected:\s*[1-9]", low_out) is not None or "starting" in low_out
             if ok:
                 time.sleep(0.18)
                 return True
@@ -1429,7 +1454,8 @@ class Adb:
                         continue
                     if tl == lab:
                         score = max(score, 1000 - i)
-                    elif lab in tl or tl in lab:
+                    elif lab in tl or (len(tl) >= 4 and tl in lab):
+                        # texto curto demais ("app", "ok") não pode "conter" o rótulo por acaso
                         score = max(score, 500 - i)
             if score < 0:
                 continue
@@ -1473,10 +1499,12 @@ class Adb:
         """Liga o controle «Auto startup» e confirma no dump que ficou ON."""
         import time
 
-        last_xml = ""
         for _ in range(5):
-            xml = self._dump_ui_xml(serial) or last_xml
-            last_xml = xml
+            xml = self._dump_ui_xml(serial) or ""
+            if not xml.strip():
+                # Sem dump novo não se toca: o XML antigo (OFF) levaria a um 2º toque que desliga o que o 1º ligou.
+                time.sleep(0.5)
+                continue
             state, xy = self._ui_autostart_startup_state(xml)
             if state == "on":
                 return True
@@ -1487,7 +1515,7 @@ class Adb:
             ):
                 self.shell_try(serial, "input keyevent 23", timeout_s=2)
             time.sleep(0.4)
-        xml = self._dump_ui_xml(serial) or last_xml
+        xml = self._dump_ui_xml(serial) or ""
         state, _xy = self._ui_autostart_startup_state(xml)
         return state == "on"
 
@@ -1672,8 +1700,9 @@ class Adb:
 
         self.set_autostart_apps_enabled(serial, False)
         display_state = self._tts_hide_display(serial) if manage_display else {}
+        anim_state: dict[str, str] = {}
         if not manage_display:
-            self._tts_prepare_fast_ui(serial)
+            anim_state = self._tts_prepare_fast_ui(serial)
         done: list[str] = [f"motor={engine}"]
         voice_ok = False
         verified = False
@@ -1738,6 +1767,11 @@ class Adb:
                     f"Pós-config TTS parcial: {trail_txt}. "
                     "A Voz V não foi confirmada na tela."
                 )
+            if voice_ok and "voz-v-nao-verificada" in done:
+                msg += (
+                    " ATENÇÃO: a marca da Voz V não pôde ser verificada na tela — "
+                    "confira no aparelho (Configurações → Saída de texto para voz)."
+                )
             return TtsConfigResult(
                 voice_v_confirmed=voice_ok,
                 engine_locale_ok=verified,
@@ -1747,6 +1781,8 @@ class Adb:
             self.close_settings_and_tts_ui(serial, stop_tts_engine=False)
             if manage_display:
                 self._tts_restore_display(serial, display_state)
+            else:
+                self._tts_restore_animations(serial, anim_state)
 
     def hide_device_screen(self, serial: str) -> dict[str, str]:
         """Zera brilho/animações para procedimentos de UI no dispositivo."""
@@ -1755,17 +1791,47 @@ class Adb:
     def restore_device_screen(self, serial: str, state: dict[str, str]) -> None:
         self._tts_restore_display(serial, state)
 
-    def _tts_prepare_fast_ui(self, serial: str) -> None:
-        """Zera animações e mantém a tela ligada — sem apagar o HDMI."""
-        self.shell_try(
-            serial,
-            "settings put global window_animation_scale 0; "
-            "settings put global transition_animation_scale 0; "
-            "settings put global animator_duration_scale 0; "
-            "svc power stayon true; "
-            "input keyevent 224",
-            timeout_s=6,
+    _ANIM_KEYS = (
+        ("WA", "global:window_animation_scale"),
+        ("TA", "global:transition_animation_scale"),
+        ("AA", "global:animator_duration_scale"),
+    )
+
+    def _tts_prepare_fast_ui(self, serial: str) -> dict[str, str]:
+        """Zera animações e mantém a tela ligada — sem apagar o HDMI. Devolve as escalas originais."""
+        blob = (
+            self.shell_try(
+                serial,
+                "echo WA=$(settings get global window_animation_scale); "
+                "echo TA=$(settings get global transition_animation_scale); "
+                "echo AA=$(settings get global animator_duration_scale); "
+                "settings put global window_animation_scale 0; "
+                "settings put global transition_animation_scale 0; "
+                "settings put global animator_duration_scale 0; "
+                "svc power stayon true; "
+                "input keyevent 224",
+                timeout_s=6,
+            )
+            or ""
         )
+        state: dict[str, str] = {}
+        for line in blob.splitlines():
+            line = line.strip()
+            for prefix, key in self._ANIM_KEYS:
+                if line.startswith(prefix + "="):
+                    state[key] = line.split("=", 1)[-1].strip()
+        return state
+
+    def _tts_restore_animations(self, serial: str, state: dict[str, str]) -> None:
+        """Devolve as escalas de animação (original; 1.0 se não foi possível ler)."""
+        parts: list[str] = []
+        for _prefix, compound in self._ANIM_KEYS:
+            val = ((state or {}).get(compound) or "").strip()
+            if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", val):
+                val = "1.0"
+            _ns, key = compound.split(":", 1)
+            parts.append(f"settings put global {key} {val}")
+        self.shell_try(serial, "; ".join(parts), timeout_s=6)
 
     def _tts_apply_engine_locale(self, serial: str, engine: str) -> None:
         """Define motor e locale pt-BR via Settings Secure (sem UI)."""
@@ -1876,7 +1942,7 @@ class Adb:
             "global:transition_animation_scale",
             "global:animator_duration_scale",
         )
-        restored_settings = False
+        brightness_restored = False
         for compound in settings_keys:
             val = (state or {}).get(compound, "")
             if not val or val.lower() == "null":
@@ -1884,9 +1950,13 @@ class Adb:
             if ":" not in compound or not re.fullmatch(r"[0-9.\-]{1,12}", val):
                 continue
             ns, key = compound.split(":", 1)
+            if compound == "system:screen_brightness":
+                if val.strip() == "0":
+                    val = "128"  # um 0 salvo vem de uma execução anterior interrompida
+                brightness_restored = True
             parts.append(f"settings put {ns} {key} {val}")
-            restored_settings = True
-        if not restored_settings:
+        if not brightness_restored:
+            # Android TV costuma devolver "null": sem valor original, nunca deixa o brilho em 0.
             parts.append("settings put system screen_brightness 128")
         for key, val in (state or {}).items():
             if key.startswith(("fb:", "bl:")) and val:
@@ -1898,7 +1968,9 @@ class Adb:
                     f"echo {val} > /sys/class/disp/disp/attr/blank 2>/dev/null"
                 )
         # Se não salvamos fb, tenta desblankar mesmo assim
-        if not any(k.startswith("fb:") for k in (state or {})):
+        if not any(
+            k.startswith("fb:") and re.fullmatch(r"[0-9]{1,6}", v or "") for k, v in (state or {}).items()
+        ):
             parts.append("echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null")
             parts.append("echo 0 > /sys/class/disp/disp/attr/blank 2>/dev/null")
         self.shell_try(serial, "; ".join(parts), timeout_s=8)
@@ -2091,6 +2163,13 @@ class Adb:
         time.sleep(1.2)
         xml = self._dump_ui_xml(serial) or ""
         screen = self._tts_classify_screen(xml)
+        for _ in range(3):
+            # Splash/carregando: reclassifica antes de decidir (pular a tela de país escolheria o país errado).
+            if screen not in ("unknown", ""):
+                break
+            time.sleep(1.5)
+            xml = self._dump_ui_xml(serial) or xml
+            screen = self._tts_classify_screen(xml)
         trail.append(f"apos-enter={screen}")
         if screen == "country":
             status("TTS: tela de país — Brasil.")
@@ -2145,15 +2224,27 @@ class Adb:
         time.sleep(0.35)
 
         xml = self._dump_ui_xml(serial) or ""
-        if self.xml_voice_v_selected(xml) or self._tts_find_voice_v_center(xml):
+        for _retry in range(3):
+            # Dump vazio não prova nada: tenta de novo antes de decidir.
+            if (xml or "").strip():
+                break
+            time.sleep(1.0)
+            xml = self._dump_ui_xml(serial) or ""
+        if self.xml_voice_v_selected(xml):
             status("TTS: Voz V marcada.")
             return True, trail + ["voz-v-ok"]
+        if self._tts_find_voice_v_center(xml):
+            # Voz V aparece na lista, mas sem marca: toca nela e confere de novo.
+            if self._tts_select_voice_v_now(serial, xml, status):
+                return True, trail + ["voz-v-ok"]
+            status("TTS: Voz V está na lista, mas a marca não foi confirmada.")
+            return True, trail + ["voz-v-nao-verificada"]
         if not (xml or "").strip():
-            status("TTS: sequência 38+Enter+5+Enter concluída.")
-            return True, trail + ["sem-dump"]
+            status("TTS: sequência 38+Enter+5+Enter concluída (tela ilegível, sem verificação).")
+            return True, trail + ["sem-dump", "voz-v-nao-verificada"]
         if self._tts_classify_screen(xml) == "voices":
-            status("TTS: tela de vozes após Enter.")
-            return True, trail + ["tela-vozes"]
+            status("TTS: tela de vozes após Enter (marca não verificada).")
+            return True, trail + ["tela-vozes", "voz-v-nao-verificada"]
         status("TTS: sequência enviada, mas a tela não mostrou Voz V.")
         return False, trail
 

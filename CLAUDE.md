@@ -57,3 +57,13 @@ Alterações não commitadas: `device_audio.py` + `test_device_audio.py` (novos)
 - **Atualização/instalação preservam `Apks/`** (`update_helper.preserve_user_data`, `setup_main`).
 - Pós-instalação sempre reabilita o Autostart (`set_autostart_apps_enabled(True)` no `finally`), mesmo se a Síntese de Voz falhar.
 - Smoke do EXE congelado sem mexer no adb do dev: `ANDROID_ADB_SERVER_PORT=5999 QT_QPA_PLATFORM=offscreen Aibox.exe`.
+
+## Lote E — Síntese de Voz / Autostart (07/10/2026, NÃO validado em aparelho)
+Só validações aditivas: o caminho que já funcionava nos Mini PCs continua devolvendo o mesmo resultado.
+- `_tts_navigate_installer`: dump vazio é refeito (3x); Voz V visível sem marca → toca nela e reconfere; se ainda não der para verificar, devolve sucesso mas com `voz-v-nao-verificada` no trail e `ATENÇÃO` na mensagem. Após o 1º Enter, tela `unknown` é reclassificada (até 3x) antes de decidir.
+- `_ui_turn_on_autostart`: dump vazio nunca gera toque (antes tocava com XML velho e desligava o que ligou).
+- `_ui_tap_label_anywhere`: texto com < 4 letras não "contém" o rótulo por acaso.
+- `_configure_autostart_app_ui`: confere a tela principal antes do BACK; reprova só se a tela estiver visível e o app ausente (senão registra "conferência indisponível").
+- Animações (`_tts_prepare_fast_ui`/`_tts_restore_animations`) e brilho/fb (`_tts_restore_display`) são restaurados; `monkey` com `Events injected: 0` cai no `am start`; `/sdcard/aibox_ui.xml` é removido.
+- Pendente (precisa de aparelho): cancelamento/prazo total, Enter duplo, código morto `_tts_*`/`_ui_navigate_*` sem chamador.
+- Testes: `test_lote_d.py`, `test_lote_e.py` (188 no total).
