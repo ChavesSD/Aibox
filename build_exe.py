@@ -19,6 +19,14 @@ PAYLOAD_DIR = ROOT / "build" / "installer_payload"
 PAYLOAD_ZIP = PAYLOAD_DIR / "aibox_payload.zip"
 
 
+# ffmpeg "essentials" (Gyan/codexffmpeg, release fixa). Só ffmpeg.exe + licença entram no app:
+# a gravação com áudio e a validação de MP4 dependem dele na máquina do técnico.
+FFMPEG_VERSION = "8.1"
+FFMPEG_URL = (
+    "https://github.com/GyanD/codexffmpeg/releases/download/"
+    f"{FFMPEG_VERSION}/ffmpeg-{FFMPEG_VERSION}-essentials_build.zip"
+)
+FFMPEG_SHA256 = "8748283d821613d930b0e7be685aaa9df4ca6f0ad4d0c42fd02622b3623463c6"
 PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
 _ADB_FILES = (
     "adb.exe",
@@ -26,6 +34,62 @@ _ADB_FILES = (
     "AdbWinUsbApi.dll",
     "libwinpthread-1.dll",
 )
+
+
+def _ensure_ffmpeg() -> Path:
+    """Garante aibox/ffmpeg/ffmpeg.exe (+ LICENSE/README) com SHA-256 do zip fixado."""
+    dest = ROOT / "aibox" / "ffmpeg"
+    exe = dest / "ffmpeg.exe"
+    marker = dest / "SOURCE.txt"
+    expected_marker = f"{FFMPEG_URL}\nsha256={FFMPEG_SHA256}\n"
+    if (
+        exe.is_file()
+        and (dest / "LICENSE.txt").is_file()
+        and marker.is_file()
+        and marker.read_text(encoding="utf-8") == expected_marker
+    ):
+        print(f"ffmpeg empacotado: {exe}")
+        return dest
+
+    import tempfile
+    import urllib.request
+
+    print(f"Baixando ffmpeg {FFMPEG_VERSION} (essentials)…")
+    dest.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="aibox_ff_") as tmp:
+        zpath = Path(tmp) / "ffmpeg.zip"
+        h = hashlib.sha256()
+        total = 0
+        with urllib.request.urlopen(FFMPEG_URL, timeout=60) as resp, zpath.open("wb") as out:
+            while True:
+                block = resp.read(1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total > 250 * 1024 * 1024:
+                    raise SystemExit("ffmpeg maior que o esperado; download abortado.")
+                h.update(block)
+                out.write(block)
+        if h.hexdigest().lower() != FFMPEG_SHA256:
+            raise SystemExit(f"SHA-256 do ffmpeg não confere ({h.hexdigest()}).")
+        wanted = {"/bin/ffmpeg.exe": "ffmpeg.exe", "/LICENSE": "LICENSE.txt", "/README.txt": "README.txt"}
+        found: set[str] = set()
+        with zipfile.ZipFile(zpath) as zf:
+            for info in zf.infolist():
+                name = "/" + info.filename.replace("\\", "/")
+                for suffix, target in wanted.items():
+                    if name.endswith(suffix) and name.count("/") == suffix.count("/") + 1:
+                        (dest / target).write_bytes(zf.read(info))
+                        found.add(target)
+        missing = set(wanted.values()) - found
+        if missing:
+            raise SystemExit("Faltam arquivos no zip do ffmpeg: " + ", ".join(sorted(missing)))
+    cp = subprocess.run([str(exe), "-version"], capture_output=True, text=True, timeout=20)
+    if cp.returncode != 0:
+        raise SystemExit("ffmpeg.exe baixado não executa.")
+    marker.write_text(expected_marker, encoding="utf-8")
+    print(f"ffmpeg pronto: {exe}")
+    return dest
 
 
 def _ensure_platform_tools() -> Path:
@@ -140,6 +204,32 @@ def _sha256(path: Path) -> str:
                 break
             h.update(b)
     return h.hexdigest()
+
+
+def _validate_release_notes(version: str) -> str | None:
+    """Mensagem de erro se as notas da versão faltarem/estiverem inconsistentes (None = ok)."""
+    if os.environ.get("AIBOX_ALLOW_NO_NOTES") == "1":
+        return None
+    import re
+
+    path = ROOT / "release_notes" / f"{version}.json"
+    if not path.is_file():
+        return (
+            f"Faltam as notas da versão: crie release_notes/{version}.json "
+            "(ou defina AIBOX_ALLOW_NO_NOTES=1 para um build de teste)."
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return f"release_notes/{version}.json inválido: {exc}"
+    if str(data.get("version") or "").lstrip("v") != version:
+        return f"release_notes/{version}.json declara versão {data.get('version')!r}, esperado {version!r}."
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(data.get("published_at") or "")):
+        return f"release_notes/{version}.json precisa de published_at no formato AAAA-MM-DD."
+    notes = data.get("notes")
+    if not isinstance(notes, dict) or not any(notes.get(k) for k in ("added", "fixed", "removed")):
+        return f"release_notes/{version}.json não lista nenhuma mudança (added/fixed/removed)."
+    return None
 
 
 def _load_notes(version: str) -> dict:
@@ -387,18 +477,18 @@ def _find_signtool() -> Path | None:
     return None
 
 
-def _try_sign(path: Path) -> None:
+def _try_sign(path: Path) -> bool:
     """Assina o .exe se AIBOX_PFX ou AIBOX_CERT_THUMBPRINT estiver definido."""
     if not path.is_file():
-        return
+        return False
     pfx = os.environ.get("AIBOX_PFX", "").strip()
     thumb = os.environ.get("AIBOX_CERT_THUMBPRINT", "").strip()
     if not pfx and not thumb:
-        return
+        return False
     signtool = _find_signtool()
     if signtool is None:
         print("AVISO: signtool não encontrado; EXE não assinado.", file=sys.stderr)
-        return
+        return False
     cmd = [
         str(signtool),
         "sign",
@@ -426,8 +516,9 @@ def _try_sign(path: Path) -> None:
     if rc.returncode != 0:
         err = (rc.stderr or rc.stdout or "").strip()
         print(f"AVISO: falha ao assinar {path.name}: {err}", file=sys.stderr)
-        return
+        return False
     print(f"Assinado: {path}")
+    return True
 
 
 def _copy_pyinstaller_setup() -> Path | None:
@@ -455,11 +546,17 @@ def main() -> int:
         print(f"Spec não encontrado: {SPEC}", file=sys.stderr)
         return 1
 
+    problem = _validate_release_notes(_app_version())
+    if problem:
+        print(problem, file=sys.stderr)
+        return 6
+
     try:
         _ensure_platform_tools()
         from aibox.device_audio import ensure_scrcpy
 
         print(f"scrcpy: {ensure_scrcpy()}")
+        _ensure_ffmpeg()
         _ensure_ico()
         _prepare_build_dirs()
     except SystemExit as e:
@@ -477,7 +574,10 @@ def main() -> int:
         return 2
 
     _copy_adb_into_dist()
-    _try_sign(out)
+    signed = _try_sign(out)
+    if os.environ.get("AIBOX_REQUIRE_SIGN") == "1" and not signed:
+        print("AIBOX_REQUIRE_SIGN=1, mas Aibox.exe não foi assinado — build abortado.", file=sys.stderr)
+        return 7
 
     version = _app_version()
     (DIST_APP / "version.txt").write_text(version + "\n", encoding="utf-8")
@@ -508,7 +608,9 @@ def main() -> int:
             print("AVISO: Aibox-Setup.exe não foi gerado.", file=sys.stderr)
 
     if setup_dst:
-        _try_sign(setup_dst)
+        if not _try_sign(setup_dst) and os.environ.get("AIBOX_REQUIRE_SIGN") == "1":
+            print("AIBOX_REQUIRE_SIGN=1, mas o instalador não foi assinado — build abortado.", file=sys.stderr)
+            return 7
 
     print()
     print(f"OK: {out}")

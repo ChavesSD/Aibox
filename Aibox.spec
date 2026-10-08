@@ -63,6 +63,18 @@ for f in sorted(scrcpy_src.iterdir()):
         continue
     binaries.append((str(f), scrcpy_dst))
 
+ffmpeg_src = PKG / "ffmpeg"
+if not (ffmpeg_src / "ffmpeg.exe").is_file():
+    raise SystemExit(
+        "ffmpeg ausente em aibox/ffmpeg. Rode python build_exe.py "
+        "(baixa o ffmpeg automaticamente: gravação com áudio e validação de MP4 dependem dele)."
+    )
+binaries.append((str(ffmpeg_src / "ffmpeg.exe"), "aibox/ffmpeg"))
+for _name in ("LICENSE.txt", "README.txt", "SOURCE.txt"):
+    _f = ffmpeg_src / _name
+    if _f.is_file():
+        datas.append((str(_f), "aibox/ffmpeg"))
+
 datas += collect_data_files("qtawesome")
 
 hiddenimports = [
@@ -74,6 +86,8 @@ hiddenimports = [
     "aibox.usbwin",
     "aibox.apk_sync",
     "aibox.device_audio",
+    "aibox.ziputil",
+    "aibox.github_fetch",
 ]
 
 a = Analysis(

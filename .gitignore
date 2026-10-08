@@ -27,6 +27,7 @@ Apks/
 aibox/platform-tools/*.exe
 aibox/platform-tools/*.dll
 aibox/scrcpy/
+aibox/ffmpeg/
 
 # IDE / OS
 .idea/

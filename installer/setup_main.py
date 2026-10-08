@@ -236,11 +236,11 @@ def perform_install(progress=None) -> Path:
             shutil.rmtree(backup, ignore_errors=True)
         had_old = INSTALL_DIR.exists()
         if had_old:
-            # preserva as capturas do usuário
+            # preserva dados do usuário (APKs já baixados e capturas) na instalação nova
             for child in INSTALL_DIR.iterdir():
-                if child.name.lower() == "capturas" and child.is_dir():
+                if child.name.lower() in ("capturas", "apks") and child.is_dir():
                     try:
-                        shutil.move(str(child), str(stage / child.name))
+                        shutil.copytree(child, stage / child.name, dirs_exist_ok=True)
                     except OSError:
                         pass
             INSTALL_DIR.rename(backup)

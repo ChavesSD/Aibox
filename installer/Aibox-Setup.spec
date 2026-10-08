@@ -18,14 +18,17 @@ ICON_PNG = ROOT / "aibox" / "Aibox.png"
 SETUP_SCRIPT = SPEC_DIR / "setup_main.py"
 
 datas = []
-if PAYLOAD.exists():
-    datas.append((str(PAYLOAD), "."))
+if not PAYLOAD.exists():
+    raise SystemExit(
+        f"Payload ausente: {PAYLOAD}. Rode python build_exe.py (gera o payload antes do Setup)."
+    )
+datas.append((str(PAYLOAD), "."))
 if ICON_PNG.exists():
     datas.append((str(ICON_PNG), "."))
 if ICON_ICO.exists():
     datas.append((str(ICON_ICO), "."))
 
-hiddenimports = ["tkinter", "tkinter.ttk", "_tkinter"]
+hiddenimports = ["tkinter", "tkinter.ttk", "_tkinter", "aibox.ziputil"]
 
 a = Analysis(
     [str(SETUP_SCRIPT)],

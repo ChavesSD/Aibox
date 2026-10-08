@@ -3295,6 +3295,12 @@ class MainWindow(QMainWindow):
                         if complete:
                             report(98, "Validação final…")
                     finally:
+                        # Idempotente: devolve o Autostart ao estado habilitado mesmo se a Síntese de Voz
+                        # falhar (senão o totem não abriria o app após reiniciar).
+                        try:
+                            self.adb.set_autostart_apps_enabled(serial, True)
+                        except Exception:
+                            pass
                         self.adb.close_settings_and_tts_ui(
                             serial, stop_tts_engine=False
                         )

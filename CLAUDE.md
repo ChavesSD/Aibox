@@ -50,3 +50,10 @@ Alterações não commitadas: `device_audio.py` + `test_device_audio.py` (novos)
 - `installer/setup_main.py`: instala em pasta de staging e troca no final (rollback se falhar; preserva `capturas`).
 - NÃO feito (decisão de produto): ACL restrita em `C:\Aibox`, remover exclusão do Defender/`Unblock-File`, uninstaller fora da pasta gravável, assinatura Authenticode/manifesto assinado, hash fixo do platform-tools no build.
 - Testes: `test_security_lote_c.py`, `test_ui_extras.py`, `test_adb_leftovers.py`.
+
+## Lote D — pacote e release (07/10/2026)
+- **ffmpeg embutido**: `build_exe._ensure_ffmpeg()` baixa o essentials 8.1 (URL e SHA-256 fixos em `build_exe.py`) para `aibox/ffmpeg/` (gitignored: só `ffmpeg.exe` + licença GPL). No app empacotado `recording._resolve_ffmpeg()` usa SÓ o ffmpeg do pacote (sem PATH/env/cwd). Não há ffprobe: `_ffmpeg_info()` lê duração/áudio de `ffmpeg -i`. Antes, sem ffmpeg/ffprobe na máquina, a gravação inteira falhava ("MP4 incompleto").
+- **Build**: `build_exe.py` exige `release_notes/<APP_VERSION>.json` válido (version igual, `published_at` AAAA-MM-DD, ao menos uma mudança; `AIBOX_ALLOW_NO_NOTES=1` p/ teste). `AIBOX_REQUIRE_SIGN=1` aborta se o exe/instalador não for assinado. Validar o spec sem tocar em processos: `python -m PyInstaller --noconfirm --clean --distpath <tmp>/dist --workpath <tmp>/build Aibox.spec` (NÃO use build_exe.py para isso: ele faz taskkill de adb/Aibox).
+- **Atualização/instalação preservam `Apks/`** (`update_helper.preserve_user_data`, `setup_main`).
+- Pós-instalação sempre reabilita o Autostart (`set_autostart_apps_enabled(True)` no `finally`), mesmo se a Síntese de Voz falhar.
+- Smoke do EXE congelado sem mexer no adb do dev: `ANDROID_ADB_SERVER_PORT=5999 QT_QPA_PLATFORM=offscreen Aibox.exe`.

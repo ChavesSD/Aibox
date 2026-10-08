@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from .paths import executable_dir, is_frozen, package_dir
 from .procutil import popen_hidden, run_hidden
 
 
@@ -63,7 +65,26 @@ def _iter_windows_registered_paths() -> list[Path]:
     return out
 
 
+def _bundled_binary(name: str) -> str | None:
+    """ffmpeg/ffprobe distribuídos com o app (onedir: _internal/aibox/ffmpeg)."""
+    base = package_dir()
+    roots = [base, base.parent, executable_dir(), executable_dir() / "_internal" / "aibox"]
+    for r in roots:
+        for rel in (
+            Path("ffmpeg") / f"{name}.exe",
+            Path("ffmpeg") / "bin" / f"{name}.exe",
+            Path(f"{name}.exe"),
+        ):
+            p = r / rel
+            if _is_executable_file(p) and _check_binary(str(p), ["-version"]):
+                return str(p)
+    return None
+
+
 def _resolve_ffmpeg() -> str | None:
+    if is_frozen():
+        # App empacotado: só o ffmpeg distribuído junto (sem PATH, cwd nem variáveis de ambiente).
+        return _bundled_binary("ffmpeg")
     env = (
         os.environ.get("AIBOX_FFMPEG_PATH")
         or os.environ.get("CONTROID_FFMPEG_PATH")
@@ -116,6 +137,8 @@ def _resolve_ffmpeg() -> str | None:
 
 
 def _resolve_ffprobe() -> str | None:
+    if is_frozen():
+        return _bundled_binary("ffprobe")  # None é normal: o ffmpeg faz a sondagem (_ffmpeg_info)
     env = (
         os.environ.get("AIBOX_FFPROBE_PATH")
         or os.environ.get("CONTROID_FFPROBE_PATH")
@@ -165,10 +188,39 @@ def _resolve_ffprobe() -> str | None:
     return None
 
 
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+_AUDIO_STREAM_RE = re.compile(r"Stream #\d+:\d+.*?:\s*Audio:")
+
+
+def _ffmpeg_info(path: Path) -> tuple[float | None, bool | None]:
+    """(duração, tem_áudio) lendo a saída de `ffmpeg -i` — usado quando não há ffprobe."""
+    ffmpeg = _resolve_ffmpeg()
+    if not ffmpeg or not path.exists():
+        return None, None
+    try:
+        cp = run_hidden(
+            [ffmpeg, "-hide_banner", "-i", str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None, None
+    text = f"{cp.stderr or ''}\n{cp.stdout or ''}"
+    duration: float | None = None
+    m = _DURATION_RE.search(text)
+    if m:
+        duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    return duration, bool(_AUDIO_STREAM_RE.search(text))
+
+
 def _duration_seconds_ffprobe(path: Path) -> float | None:
     ffprobe = _resolve_ffprobe()
     if not ffprobe:
-        return None
+        return _ffmpeg_info(path)[0]
 
     cmd = [
         ffprobe,
@@ -224,8 +276,10 @@ def _mp4_is_playable(path: Path) -> bool:
 def _has_audio_stream(path: Path) -> bool:
     """True se o arquivo tiver ao menos uma faixa de áudio."""
     ffprobe = _resolve_ffprobe()
-    if not ffprobe or not path.exists():
+    if not path.exists():
         return False
+    if not ffprobe:
+        return bool(_ffmpeg_info(path)[1])
     cmd = [
         ffprobe,
         "-v",

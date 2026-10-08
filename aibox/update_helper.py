@@ -110,6 +110,23 @@ def _payload_from_extract(staging: Path) -> Path:
     return found[0].parent
 
 
+# Dados do usuário dentro da pasta de instalação que a troca de pastas não pode perder.
+_PRESERVED_DIRS = ("Apks",)
+
+
+def preserve_user_data(install_dir: Path, new_dir: Path) -> None:
+    """Copia os APKs já baixados para a versão nova (sem internet em campo, perdê-los é grave)."""
+    for name in _PRESERVED_DIRS:
+        src = install_dir / name
+        if not src.is_dir():
+            continue
+        try:
+            shutil.copytree(src, new_dir / name, dirs_exist_ok=True)
+        except OSError:
+            # Não bloqueia a atualização; o app baixa de novo se faltar.
+            pass
+
+
 def stage_new_onedir(package: Path, install_dir: Path) -> Path:
     """Extrai o ZIP para uma pasta irmã. Não mexe na instalação em uso."""
     stamp = int(time.time())
@@ -133,6 +150,7 @@ def stage_new_onedir(package: Path, install_dir: Path) -> Path:
 
     if not (new_dir / "Aibox.exe").is_file():
         raise RuntimeError("Pacote extraído sem Aibox.exe.")
+    preserve_user_data(install_dir, new_dir)
     return new_dir
 
 
