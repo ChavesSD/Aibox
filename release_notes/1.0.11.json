@@ -1,0 +1,29 @@
+{
+  "version": "1.0.11",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-10-07",
+  "notes": {
+    "added": [
+      "Gravação de tela agora inclui o áudio do equipamento (som HDMI do Mini PC) no mesmo MP4",
+      "ffmpeg embutido no app: a gravação funciona sem instalar nada no PC",
+      "Botão Parear para a Depuração sem fio (Android 11+)",
+      "Os APKs já baixados são mantidos ao atualizar o app",
+      "Confirmação ao sair durante gravação, instalação ou outra operação em andamento"
+    ],
+    "fixed": [
+      "Restauração de fábrica só informa sucesso quando o aparelho realmente reinicia",
+      "Atualização e download de APKs exigem checksum e só aceitam HTTPS do repositório oficial",
+      "Instalador troca a versão com rollback: uma falha na cópia não deixa o app quebrado",
+      "Autostart volta a ser habilitado mesmo quando a Síntese de Voz falha",
+      "Síntese de Voz e Autostart sinalizam quando a configuração não pôde ser verificada na tela",
+      "Botões de gravação, instalação e desinstalação não ficam mais travados após um erro",
+      "Parar a gravação não congela mais a janela",
+      "Validação do endereço Wi-Fi e timeout de conexão corrigidos",
+      "Brilho e animações do aparelho são restaurados após a configuração da voz"
+    ],
+    "removed": [
+      "Gravação de áudio pelo microfone do Windows (substituída pelo áudio do equipamento)"
+    ]
+  }
+}
