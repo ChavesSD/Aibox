@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import QThread, Signal
 
 
@@ -23,6 +25,7 @@ class LogcatThread(QThread):
                 if ln == "" or ln is None:
                     if self.popen.poll() is not None:
                         break
+                    time.sleep(0.05)
                     continue
                 if isinstance(ln, bytes):
                     text = ln.decode("utf-8", "replace")

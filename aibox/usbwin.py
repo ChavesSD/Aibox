@@ -41,17 +41,19 @@ def _device_id_list(enumerator: str) -> list[str]:
     ]
     cfg.CM_Get_Device_ID_ListW.restype = ctypes.c_ulong
     flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT
-    size = ctypes.c_ulong(0)
-    cr = cfg.CM_Get_Device_ID_List_SizeW(ctypes.byref(size), enumerator, flags)
-    if cr != CR_SUCCESS or size.value <= 1:
-        return []
-    buf = ctypes.create_unicode_buffer(size.value)
-    cr = cfg.CM_Get_Device_ID_ListW(enumerator, buf, size, flags)
-    if cr != CR_SUCCESS:
-        return []
-    raw = buf[: size.value]
-    parts = raw.split("\x00")
-    return [p for p in parts if p]
+    # Entre pedir o tamanho e ler a lista um dispositivo pode ser plugado (CR_BUFFER_SMALL): repete.
+    for _attempt in range(4):
+        size = ctypes.c_ulong(0)
+        cr = cfg.CM_Get_Device_ID_List_SizeW(ctypes.byref(size), enumerator, flags)
+        if cr != CR_SUCCESS or size.value <= 1:
+            return []
+        buf = ctypes.create_unicode_buffer(size.value + 256)
+        cr = cfg.CM_Get_Device_ID_ListW(enumerator, buf, size.value + 256, flags)
+        if cr == CR_SUCCESS:
+            raw = buf[: size.value + 256]
+            parts = raw.split("\x00")
+            return [p for p in parts if p]
+    return []
 
 
 def list_present_usb() -> list[PresentUsb]:

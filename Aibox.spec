@@ -49,6 +49,20 @@ for f in sorted(pt_src.glob("*.dll")):
     if pair not in binaries:
         binaries.append(pair)
 
+scrcpy_src = PKG / "scrcpy"
+scrcpy_dst = "aibox/scrcpy"
+if not (scrcpy_src / "scrcpy.exe").is_file():
+    raise SystemExit(
+        "scrcpy ausente em aibox/scrcpy. Rode python build_exe.py "
+        "(baixa o scrcpy automaticamente para gravar áudio do Mini PC)."
+    )
+for f in sorted(scrcpy_src.iterdir()):
+    if not f.is_file():
+        continue
+    if f.name in ("adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll"):
+        continue
+    binaries.append((str(f), scrcpy_dst))
+
 datas += collect_data_files("qtawesome")
 
 hiddenimports = [
@@ -59,6 +73,7 @@ hiddenimports = [
     "aibox.procutil",
     "aibox.usbwin",
     "aibox.apk_sync",
+    "aibox.device_audio",
 ]
 
 a = Analysis(

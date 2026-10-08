@@ -3,22 +3,21 @@ from __future__ import annotations
 
 import json
 import os
-import urllib.request
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .apks_catalog import APK_CATALOG, APK_CATEGORIES, ApkEntry, apks_root, ensure_apks_tree
 from .github_fetch import (
-    GITHUB_API_CONTENTS,
-    GITHUB_REPO,
+    MAX_APK_BYTES,
     RemoteFetchError,
     github_api_file as _github_api_file,
+    is_allowed_url,
     http_get as _shared_http_get,
     relative_from_url as _relative_from_url,
     releases_mirror_urls,
     rewrite_url_to_working_host as _rewrite_url_to_working_host,
-    ua_headers as _ua_headers,
 )
 from .theme import DEFAULT_APKS_MANIFEST_URL
 from .updater import ReleaseAsset, UpdateError, download_asset, sha256_file, verify_sha256
@@ -29,6 +28,10 @@ ItemCb = Callable[[str], None]
 
 class ApksManifestNotFound(UpdateError):
     pass
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_APK_FILENAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,100}\.apk")
 
 
 @dataclass(frozen=True)
@@ -117,21 +120,35 @@ def parse_apks_manifest(data: dict) -> ApksManifest:
         if not isinstance(raw_list, list) or not raw_list:
             raise UpdateError("Manifesto de APKs sem lista 'apks'.")
         apks: list[RemoteApk] = []
+        rejected = 0
         for item in raw_list:
             if not isinstance(item, dict):
                 continue
-            apks.append(
-                RemoteApk(
-                    category=str(item["category"]).strip(),
-                    filename=str(item["filename"]).strip(),
-                    label=str(item.get("label") or item["filename"]).strip(),
-                    sha256=str(item["sha256"]).lower().strip(),
-                    size=int(item.get("size") or 0),
-                    url=str(item["url"]).strip(),
-                )
+            apk = RemoteApk(
+                category=str(item["category"]).strip(),
+                filename=str(item["filename"]).strip(),
+                label=str(item.get("label") or item["filename"]).strip(),
+                sha256=str(item["sha256"]).lower().strip(),
+                size=int(item.get("size") or 0),
+                url=str(item["url"]).strip(),
             )
+            # Entrada fora do padrão (path traversal, sem checksum, host estranho) é descartada.
+            if (
+                apk.category not in APK_CATEGORIES
+                or not _APK_FILENAME_RE.fullmatch(apk.filename)
+                or not _SHA256_RE.fullmatch(apk.sha256)
+                or not is_allowed_url(apk.url)
+                or apk.size < 0
+                or apk.size > MAX_APK_BYTES
+            ):
+                rejected += 1
+                continue
+            apks.append(apk)
         if not apks:
-            raise UpdateError("Manifesto de APKs vazio.")
+            raise UpdateError(
+                "Manifesto de APKs vazio ou sem entradas válidas"
+                + (f" ({rejected} rejeitada(s): categoria, nome, checksum ou URL inválidos)." if rejected else ".")
+            )
         return ApksManifest(
             version=str(data.get("version") or "0.0.0").lstrip("v"),
             updated_at=str(data.get("updated_at") or ""),
@@ -146,21 +163,10 @@ def fetch_apks_manifest(url: str | None = None, *, timeout_s: float = 20.0) -> A
     try:
         raw, working = _http_get(target, timeout_s=timeout_s, accept="application/json")
     except TimeoutError as e:
-        listed = _manifest_from_github_assets(timeout_s=timeout_s)
-        if listed is not None:
-            return listed
         raise UpdateError("Timeout ao buscar catálogo de APKs.") from e
-    except UpdateError:
-        listed = _manifest_from_github_assets(timeout_s=timeout_s)
-        if listed is not None:
-            return listed
-        raise
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
-        listed = _manifest_from_github_assets(timeout_s=timeout_s)
-        if listed is not None:
-            return listed
         raise UpdateError("Catálogo de APKs não é JSON válido.") from e
     if not isinstance(payload, dict):
         raise UpdateError("Catálogo de APKs deve ser um objeto JSON.")
@@ -185,49 +191,6 @@ def fetch_apks_manifest(url: str | None = None, *, timeout_s: float = 20.0) -> A
     )
 
 
-def _manifest_from_github_assets(*, timeout_s: float = 20.0) -> ApksManifest | None:
-    """Lista apk_assets/ na API (Totem-Upzz.apk → Totem/Upzz.apk) se o JSON falhar."""
-    req = urllib.request.Request(
-        GITHUB_API_CONTENTS + "apk_assets",
-        headers=_ua_headers("application/vnd.github+json"),
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            items = json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
-    if not isinstance(items, list):
-        return None
-    catalog = {(e.category, e.filename): e for e in APK_CATALOG}
-    apks: list[RemoteApk] = []
-    for item in items:
-        if not isinstance(item, dict) or item.get("type") != "file":
-            continue
-        parsed = parse_repo_asset_name(str(item.get("name") or ""))
-        if parsed is None:
-            continue
-        category, filename = parsed
-        entry = catalog.get((category, filename))
-        name = str(item.get("name") or "")
-        url = str(item.get("download_url") or "").strip() or (
-            f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/apk_assets/{name}"
-        )
-        apks.append(
-            RemoteApk(
-                category=category,
-                filename=filename,
-                label=(entry.label if entry else filename),
-                sha256="",
-                size=int(item.get("size") or 0),
-                url=url,
-            )
-        )
-    if not apks:
-        return None
-    return ApksManifest(version="github-assets", updated_at="", apks=tuple(apks))
-
-
 def _local_sha(path: Path) -> str | None:
     if not path.is_file() or path.stat().st_size <= 0:
         return None
@@ -246,6 +209,11 @@ def plan_apk_sync(manifest: ApksManifest, *, root: Path | None = None) -> list[A
             # ainda baixa APKs novos publicados no manifesto
             pass
         local = dest_root / remote.relative_path
+        try:
+            if dest_root.resolve() not in local.resolve().parents:
+                continue  # nunca planeja gravar fora da pasta de APKs
+        except OSError:
+            continue
         digest = _local_sha(local)
         if digest is None:
             status = "missing"
@@ -281,10 +249,15 @@ def sync_apks(
 
     for item in wanted:
         label = f"{item.remote.category}/{item.remote.filename}"
+        if not _SHA256_RE.fullmatch((item.remote.sha256 or "").lower()):
+            failed.append(f"{label}: sem checksum válido no catálogo — não instalado por segurança")
+            continue
         if on_item:
             on_item(f"Baixando {item.remote.label} ({label})…")
         item.local.parent.mkdir(parents=True, exist_ok=True)
         last_error: Exception | None = None
+        # download_asset valida o sha256 no .part ANTES de trocar o APK existente;
+        # em qualquer falha o arquivo bom que já estava no disco é preservado.
         for mirror in releases_mirror_urls(item.remote.url) or [item.remote.url]:
             asset = ReleaseAsset(
                 name=item.remote.filename,
@@ -293,9 +266,15 @@ def sync_apks(
                 size=item.remote.size,
             )
             try:
-                download_asset(asset, item.local, progress=progress, timeout_s=300.0)
-                if item.remote.sha256:
-                    verify_sha256(item.local, item.remote.sha256)
+                download_asset(
+                    asset,
+                    item.local,
+                    progress=progress,
+                    timeout_s=300.0,
+                    expected_sha256=item.remote.sha256,
+                    max_bytes=MAX_APK_BYTES,
+                    deadline_s=1800.0,
+                )
                 downloaded += 1
                 last_error = None
                 break
@@ -306,22 +285,23 @@ def sync_apks(
             if not relative and item.remote.filename:
                 relative = f"apk_assets/{item.remote.category}-{item.remote.filename}"
             if relative:
+                part = item.local.with_suffix(item.local.suffix + ".part")
                 try:
                     data = _github_api_file(relative, timeout_s=300.0)
-                    item.local.write_bytes(data)
-                    if item.remote.sha256:
-                        verify_sha256(item.local, item.remote.sha256)
+                    part.write_bytes(data)
+                    verify_sha256(part, item.remote.sha256)
+                    part.replace(item.local)
                     downloaded += 1
                     last_error = None
                 except Exception as e:
                     last_error = e
+                finally:
+                    try:
+                        part.unlink(missing_ok=True)
+                    except OSError:
+                        pass
         if last_error is not None:
             failed.append(f"{label}: {last_error}")
-            try:
-                if item.local.exists():
-                    item.local.unlink()
-            except OSError:
-                pass
 
     return ApkSyncResult(downloaded=downloaded, skipped=skipped, failed=failed)
 

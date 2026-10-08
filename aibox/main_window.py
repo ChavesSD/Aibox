@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import secrets
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QButtonGroup,
+    QCheckBox,
     QComboBox,
     QFrame,
     QFileDialog,
@@ -36,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .adb import Adb, AdbDevice, AdbError, AutostartConfigResult, InstalledApp, TtsConfigResult
+from .adb import uninstall_protection, Adb, AdbDevice, AdbError, AutostartConfigResult, InstalledApp, TtsConfigResult
 from .apks_catalog import (
     APK_CATALOG,
     APK_CATEGORIES,
@@ -46,9 +48,9 @@ from .apks_catalog import (
     resolve_apk,
 )
 from .apk_sync import ApkSyncResult, sync_apks
-from .audio_record import MicDevice, MicRecordThread, list_microphones
+from .device_audio import DeviceAudioRecordThread
 from .logcat import LogcatThread
-from .recording import ScreenRecordThread
+from .recording import ScreenRecordThread, _resolve_ffmpeg, mux_audio_into_mp4
 from .nav_icon_anim import NavIconAnimator
 from .page_header import PageHeader
 from .paths import is_frozen, resource_path
@@ -312,8 +314,21 @@ class MainWindow(QMainWindow):
         self._last_device_status: str | None = None
         self.logcat_thread: LogcatThread | None = None
         self.record_thread: ScreenRecordThread | None = None
-        self.audio_thread: MicRecordThread | None = None
+        self.audio_thread: DeviceAudioRecordThread | None = None
         self._audio_out_path: Path | None = None
+        self._audio_delay_s: float = 0.0
+        self._record_started_at: float = 0.0
+        self._retired_threads: list = []
+        self._thread_reaper = QTimer(self)
+        self._thread_reaper.setInterval(500)
+        self._thread_reaper.timeout.connect(self._reap_threads)
+        self._preview_token: int = 0
+        self._quick_busy: set[str] = set()
+        self._factory_reset_busy: bool = False
+        self._closing: bool = False
+        self._adb_initing: bool = False
+        self._autostart_auto: bool = False  # Autostart marcado automaticamente (não pelo usuário)
+        self._last_apk_avail_msg: str = ""
         self.recording_state: str = "idle"
         self.recording_started_at: float | None = None
         self.recording_timer = QTimer(self)
@@ -368,10 +383,11 @@ class MainWindow(QMainWindow):
         if self._startup_done:
             return
         self._startup_done = True
-        # Depois da janela aparecer: ADB e mics (sem bloquear nem abrir console).
+        # Depois da janela aparecer: ADB (sem bloquear nem abrir console).
         QTimer.singleShot(0, self._init_adb)
-        QTimer.singleShot(80, self.refresh_microphones)
         QTimer.singleShot(400, self._auto_sync_apks)
+        # Depois de rodar com sucesso por um tempo, o backup da versão anterior pode sair.
+        QTimer.singleShot(45000, self._cleanup_after_update)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -794,6 +810,14 @@ class MainWindow(QMainWindow):
         self.btn_wifi_toggle = QPushButton()
         self.btn_wifi_toggle.clicked.connect(self.toggle_wifi)
 
+        self.btn_wifi_pair = QPushButton("Parear…")
+        self.btn_wifi_pair.setObjectName("SecondaryButton")
+        self.btn_wifi_pair.setToolTip(
+            "Depuração sem fio (Android 11+): pareia com o código de 6 dígitos "
+            "mostrado em «Parear dispositivo com código»."
+        )
+        self.btn_wifi_pair.clicked.connect(self.pair_wifi)
+
         fields.addWidget(self._outlined("Dispositivo", self.cmb_device))
         fields.addWidget(self._outlined("Wi‑Fi", self.txt_wifi))
         card_lay.addLayout(fields)
@@ -803,7 +827,7 @@ class MainWindow(QMainWindow):
         card_lay.addStretch(1)
 
         lay.addWidget(self._wrap_card(card), 1)
-        lay.addWidget(self._make_action_bar(self.btn_refresh, self.btn_wifi_toggle))
+        lay.addWidget(self._make_action_bar(self.btn_refresh, self.btn_wifi_pair, self.btn_wifi_toggle))
         return w
 
     def _tab_dpi(self) -> QWidget:
@@ -863,7 +887,11 @@ class MainWindow(QMainWindow):
         w, lay = self._make_page()
         card, card_lay = self._make_card()
         card_lay.addWidget(self._section_title("Gravação de tela"))
-        card_lay.addWidget(self._page_tip("Grave a tela do dispositivo conectado e salve o vídeo no PC."))
+        card_lay.addWidget(
+            self._page_tip(
+                "Grave a tela do Mini PC conectado. O áudio é o som reproduzido no equipamento (HDMI), não o microfone do Windows."
+            )
+        )
 
         self.txt_out_gravar = QLineEdit(str(self.output_dir))
         self.btn_out_gravar = QPushButton("Trocar…")
@@ -881,21 +909,17 @@ class MainWindow(QMainWindow):
         audio_row = QHBoxLayout()
         audio_row.setSpacing(10)
         self.chk_record_audio = ToggleSwitch()
-        self.chk_record_audio.setToolTip("Grava o microfone do PC no mesmo período do vídeo, em arquivo WAV separado.")
-        self.lbl_record_audio = QLabel("Gravar áudio")
+        self.chk_record_audio.setChecked(True)
+        self.chk_record_audio.setToolTip(
+            "Captura o áudio reproduzido no Mini PC (saída HDMI) e inclui no mesmo arquivo MP4. "
+            "Requer Android 11 ou superior."
+        )
+        self.lbl_record_audio = QLabel("Áudio do Mini PC")
         self.lbl_record_audio.setObjectName("ToggleRowLabel")
-        self.cmb_mic = QComboBox()
-        self.cmb_mic.setMinimumContentsLength(28)
-        self.cmb_mic.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self.btn_refresh_mics = QPushButton("Atualizar mics")
-        self.btn_refresh_mics.setObjectName("SecondaryButton")
-        self.btn_refresh_mics.clicked.connect(self.refresh_microphones)
         audio_row.addWidget(self.chk_record_audio, 0, Qt.AlignVCenter)
         audio_row.addWidget(self.lbl_record_audio, 0, Qt.AlignVCenter)
-        audio_row.addWidget(self._outlined("Microfone", self.cmb_mic), 1)
-        audio_row.addWidget(self.btn_refresh_mics, 0, Qt.AlignVCenter)
+        audio_row.addStretch(1)
         card_lay.addLayout(audio_row)
-        self.chk_record_audio.toggled.connect(self._on_record_audio_toggled)
 
         self.txt_gravar_out = self._status_box("Status da gravação…", compact=True)
         card_lay.addWidget(self.txt_gravar_out)
@@ -1279,17 +1303,45 @@ class MainWindow(QMainWindow):
         if not selected:
             QMessageBox.warning(self, APP_NAME, "Selecione ao menos um aplicativo.")
             return
-        names = ", ".join(a.display for a in selected[:8])
-        extra = "" if len(selected) <= 8 else f" e mais {len(selected) - 8}"
+        busy = self._device_busy()
+        if busy:
+            QMessageBox.information(self, APP_NAME, f"Há {busy} em andamento. Aguarde terminar.")
+            return
+        blocked = [a for a in selected if uninstall_protection(a.package) == "blocked"]
+        if blocked:
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                "Estes componentes essenciais do Android não podem ser desinstalados pelo Aibox "
+                "e foram removidos da seleção:\n\n" + "\n".join(f"• {a.display} ({a.package})" for a in blocked),
+            )
+            selected = [a for a in selected if a not in blocked]
+            if not selected:
+                return
+        risky = [a for a in selected if a.system or uninstall_protection(a.package) == "sensitive"]
+        listing = "\n".join(f"• {a.display} ({a.package})" for a in selected[:30])
+        if len(selected) > 30:
+            listing += f"\n… e mais {len(selected) - 30}"
         confirm = QMessageBox.warning(
             self,
             APP_NAME,
-            f"Desinstalar {len(selected)} app(s)?\n\n{names}{extra}\n\nEsta ação não pode ser desfeita.",
+            f"Desinstalar {len(selected)} app(s)?\n\n{listing}\n\nEsta ação não pode ser desfeita.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if confirm != QMessageBox.Yes:
             return
+        if risky:
+            typed, ok_ = QInputDialog.getText(
+                self,
+                "Confirmar desinstalação sensível",
+                "Entre os selecionados há apps de sistema ou do kiosk (autostart/TTS):\n"
+                + "\n".join(f"• {a.display}" for a in risky[:10])
+                + "\n\nRemover pode deixar o aparelho inutilizável.\nDigite DESINSTALAR para continuar:",
+            )
+            if not ok_ or typed.strip().upper() != "DESINSTALAR":
+                QMessageBox.information(self, APP_NAME, "Desinstalação cancelada.")
+                return
         self._uninstall_busy = True
         self._uninstall_queue = list(selected)
         self._uninstall_total = len(selected)
@@ -1324,6 +1376,12 @@ class MainWindow(QMainWindow):
         return int(round(100.0 * self._uninstall_done / self._uninstall_total))
 
     def _uninstall_next(self, serial: str) -> None:
+        try:
+            self._uninstall_next_impl(serial)
+        except Exception as exc:  # noqa: BLE001
+            self._uninstall_fatal(exc)
+
+    def _uninstall_next_impl(self, serial: str) -> None:
         if not self._uninstall_queue:
             self._uninstall_busy = False
             self.btn_uninstall_refresh.setEnabled(True)
@@ -1355,7 +1413,11 @@ class MainWindow(QMainWindow):
             self._set_uninstall_progress(self._uninstall_progress_percent(), animate=True)
             self._uninstall_next(serial)
 
-        self.bg.run(fn, ok, err)
+        self.bg.run(
+            fn,
+            self._guarded(ok, self._uninstall_fatal),
+            self._guarded(err, self._uninstall_fatal),
+        )
 
     @Slot()
     def start_optimize_device(self) -> None:
@@ -1365,6 +1427,25 @@ class MainWindow(QMainWindow):
         serial = self._require_serial()
         if not serial or not self.adb:
             return
+        busy = self._device_busy()
+        if busy:
+            QMessageBox.information(self, APP_NAME, f"Há {busy} em andamento. Aguarde terminar.")
+            return
+        box_ = QMessageBox(self)
+        box_.setIcon(QMessageBox.Question)
+        box_.setWindowTitle(APP_NAME)
+        box_.setText(
+            "Otimizar o aparelho?\n\n"
+            "Serão feitos: limpeza de caches dos apps, compilação (dexopt) e liberação de RAM.\n"
+            "Nenhum app, foto ou documento é removido."
+        )
+        deep = QCheckBox("Limpeza profunda: apagar /data/local/tmp, lixeiras e limpar o logcat")
+        box_.setCheckBox(deep)
+        box_.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        box_.setDefaultButton(QMessageBox.No)
+        if box_.exec() != QMessageBox.Yes:
+            return
+        deep_clean = deep.isChecked()
         self._optimize_busy = True
         self.btn_optimize.setEnabled(False)
         self.progress_optimize.setVisible(True)
@@ -1373,7 +1454,7 @@ class MainWindow(QMainWindow):
 
         def fn() -> str:
             assert self.adb is not None
-            return self.adb.optimize_device(serial)
+            return self.adb.optimize_device(serial, deep_clean=deep_clean)
 
         def ok(report: str) -> None:
             self._append(self.txt_optimize_out, report)
@@ -1434,8 +1515,20 @@ class MainWindow(QMainWindow):
                 self._set_catalog_apk_checked(self._sintese_de_voz_entry(), True)
             else:
                 self._set_catalog_apk_checked(self._sintese_de_voz_entry(), False)
-        if not self._is_autostart_apk(entry):
+        if self._is_autostart_apk(entry):
+            # Só chega aqui por clique do usuário (as marcações automáticas bloqueiam o sinal).
+            self._autostart_auto = False
+        else:
             self._sync_autostart_checkbox()
+
+    def _autostart_checked(self) -> bool:
+        entry = self._autostart_entry()
+        if entry is None:
+            return False
+        for e, row in self._apk_rows.get(entry.category) or []:
+            if e.filename == entry.filename:
+                return row.isChecked()
+        return False
 
     def _any_apk_checked_in(self, category: str) -> bool:
         rows = self._apk_rows.get(category) or []
@@ -1473,9 +1566,15 @@ class MainWindow(QMainWindow):
         if not getattr(self, "_apk_rows", None):
             return
         want = self._any_non_autostart_apk_checked()
-        self._set_catalog_apk_checked(self._autostart_entry(), want, force=True)
         if want:
+            if not self._autostart_checked():
+                self._autostart_auto = True
+                self._set_catalog_apk_checked(self._autostart_entry(), True, force=True)
             self._expand_apk_category("Outros")
+        elif self._autostart_auto:
+            # Desmarca só o que o app marcou; uma escolha explícita do usuário é respeitada.
+            self._autostart_auto = False
+            self._set_catalog_apk_checked(self._autostart_entry(), False, force=True)
 
     def _expand_apk_category(self, category: str) -> None:
         btn = self._apk_accordion_btns.get(category)
@@ -1559,6 +1658,7 @@ class MainWindow(QMainWindow):
         card_lay.addWidget(self._page_tip("Visualize os logs do dispositivo em tempo real."))
 
         self.txt_logcat = self._status_box("Logs aparecerão aqui…", fill=True)
+        self.txt_logcat.document().setMaximumBlockCount(5000)
         card_lay.addWidget(self.txt_logcat, 1)
 
         self.btn_logcat_clear = QPushButton("Limpar")
@@ -1709,6 +1809,15 @@ class MainWindow(QMainWindow):
             )
             return
 
+        ops = [o for o in self._active_operations() if o != "atualização do app"]
+        if ops:
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "Termine antes de atualizar: " + ", ".join(ops) + ".",
+            )
+            return
+
         self._update_busy = True
         self.btn_check_updates.setEnabled(False)
         self.lbl_update_status.setText(f"Baixando {result.remote.version}…")
@@ -1748,6 +1857,7 @@ class MainWindow(QMainWindow):
                     install_dir=install_dir,
                     package=Path(package_path),
                     restart=True,
+                    sha256=result.remote.asset.sha256,
                 )
             except Exception as e:
                 self._update_busy = False
@@ -1759,6 +1869,8 @@ class MainWindow(QMainWindow):
                 APP_NAME,
                 "A atualização será aplicada agora.\nO Aibox será reiniciado.",
             )
+            self._closing = True
+            self._shutdown_work()
             app = QApplication.instance()
             if app is not None:
                 app.quit()
@@ -1778,17 +1890,31 @@ class MainWindow(QMainWindow):
         self.bg.run(fn, ok, err)
 
     def _init_adb(self) -> None:
+        if self._adb_initing:
+            return
+        self._adb_initing = True
+
         def fn() -> str:
-            self.adb = Adb()
-            return self.adb.version()
+            adb = Adb()
+            adb.restart_guard = self._adb_restart_unsafe
+            ver = adb.version()
+            self.adb = adb
+            return ver
 
         def ok(ver: str) -> None:
+            self._adb_initing = False
             assert self.adb is not None
             first = (ver or "").splitlines()[0].strip() if ver else "ADB"
             self._append(self.txt_connect_out, f"{first} pronto.")
             self.refresh_devices()
 
-        self.bg.run(fn, ok, self._err_dialog)
+        def err(msg: str) -> None:
+            self._adb_initing = False
+            self.adb = None
+            self._append(self.txt_connect_out, f"ADB indisponível: {msg}")
+            self._err_dialog(msg + "\n\nClique em «Atualizar» para tentar iniciar o ADB novamente.")
+
+        self.bg.run(fn, ok, err)
 
     def _on_device_chosen(self, _index: int = 0) -> None:
         serial = self._selected_serial()
@@ -1878,6 +2004,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def _start_recording_ui(self, serial: str) -> None:
+        self._preview_token += 1
         self.preview_serial = serial
         self.preview_inflight = False
         self.preview_last_refresh_ms = 0
@@ -1892,6 +2019,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(200, self._request_preview_frame)
 
     def _stop_recording_ui(self) -> None:
+        self._preview_token += 1
         self.recording_timer.stop()
         self.recording_started_at = None
         self.preview_serial = None
@@ -1925,12 +2053,15 @@ class MainWindow(QMainWindow):
             return
         self.preview_inflight = True
         serial = self.preview_serial
+        token = self._preview_token
 
         def fn() -> bytes:
             assert self.adb is not None
             return self.adb.screencap_png_bytes(serial, timeout_s=10)
 
         def ok(data: bytes) -> None:
+            if token != self._preview_token:
+                return  # quadro atrasado de uma gravação já encerrada
             self.preview_inflight = False
             if not self.preview_panel:
                 return
@@ -1947,6 +2078,8 @@ class MainWindow(QMainWindow):
             self.preview_panel.set_frame(pm)
 
         def err(msg: str) -> None:
+            if token != self._preview_token:
+                return
             self.preview_inflight = False
             if self.preview_panel:
                 self.preview_panel.set_status(msg)
@@ -1957,6 +2090,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def refresh_devices(self) -> None:
         if not self.adb:
+            self._init_adb()  # nova tentativa caso o ADB não tenha subido
             return
 
         def fn() -> tuple[list[AdbDevice], str | None]:
@@ -2008,37 +2142,24 @@ class MainWindow(QMainWindow):
         self.connect_wifi()
 
     def _normalize_wifi_address(self, text: str) -> tuple[str | None, str | None]:
-        raw = (text or "").strip().replace("_", "").replace(" ", "")
-        raw = re.sub(r"\.+", ".", raw)
-        raw = raw.strip(".")
+        raw = (text or "").strip()
         if not raw or raw == ":":
             return None, "Informe IP:PORTA."
-        if raw.isdigit():
+        if re.fullmatch(r"[0-9]+", raw):
             return None, "Informe IP:PORTA (não apenas a porta)."
-        if ":" not in raw:
-            if raw.count(".") == 3 and all(p.isdigit() for p in raw.split(".")):
-                octets = [str(int(p)) for p in raw.split(".")]
-                return f"{'.'.join(octets)}:5555", None
-            return None, "Informe IP:PORTA."
-
-        host, port_txt = raw.rsplit(":", 1)
-        host = host.strip().strip(".")
-        port_txt = port_txt.strip()
-        if not host or not port_txt.isdigit():
-            return None, "Informe IP:PORTA."
-        parts = host.split(".")
-        if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        m = re.fullmatch(r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})(?::([0-9]{1,5}))?", raw)
+        if not m:
             return None, "Informe um IPv4 válido (ex: 192.168.0.10:5555)."
-        octets: list[str] = []
-        for p in parts:
-            n = int(p)
-            if n > 255:
-                return None, "Octeto de IP inválido (0–255)."
-            octets.append(str(n))
-        port = int(port_txt)
+        octets = [int(p) for p in m.group(1).split(".")]
+        if any(o > 255 for o in octets):
+            return None, "Octeto de IP inválido (0–255)."
+        ip = ipaddress.IPv4Address(".".join(str(o) for o in octets))
+        if ip.is_unspecified or ip.is_loopback or ip.is_multicast or ip == ipaddress.IPv4Address("255.255.255.255"):
+            return None, "Esse endereço IP não pode ser usado para conectar a um aparelho."
+        port = int(m.group(2)) if m.group(2) else 5555
         if port < 1 or port > 65535:
             return None, "Porta inválida. Use um valor entre 1 e 65535."
-        return f"{'.'.join(octets)}:{port}", None
+        return f"{ip}:{port}", None
 
     def _wifi_address_is_valid(self, text: str) -> bool:
         addr, err = self._normalize_wifi_address(text)
@@ -2137,6 +2258,54 @@ class MainWindow(QMainWindow):
         return None
 
     @Slot()
+    def pair_wifi(self) -> None:
+        """Pareamento da Depuração sem fio (IP:PORTA de pareamento + código de 6 dígitos)."""
+        if not self.adb:
+            self._init_adb()
+            QMessageBox.information(self, APP_NAME, "O ADB ainda não está pronto. Tente de novo em instantes.")
+            return
+        if "pair" in self._quick_busy:
+            return
+        text, ok = QInputDialog.getText(
+            self,
+            "Parear dispositivo",
+            "No aparelho: Depuração sem fio → «Parear dispositivo com código».\n"
+            "Digite o IP:PORTA exibido ali (a porta de pareamento é diferente da de conexão):",
+            text=self.txt_wifi.text().strip(),
+        )
+        if not ok:
+            return
+        raw = text.strip()
+        if ":" not in raw:
+            QMessageBox.warning(self, APP_NAME, "Informe IP:PORTA do pareamento (ex.: 192.168.0.10:37123).")
+            return
+        address, err_txt = self._normalize_wifi_address(raw)
+        if err_txt or not address:
+            QMessageBox.warning(self, APP_NAME, err_txt or "Endereço inválido.")
+            return
+        code, ok = QInputDialog.getText(
+            self, "Parear dispositivo", "Código de pareamento (6 dígitos):"
+        )
+        code = code.strip()
+        if not ok:
+            return
+        if not re.fullmatch(r"[0-9]{6}", code):
+            QMessageBox.warning(self, APP_NAME, "O código de pareamento tem 6 dígitos.")
+            return
+
+        def fn() -> str:
+            assert self.adb is not None
+            return self.adb.pair(address, code)
+
+        def done(msg: str) -> None:
+            self._wifi_log(f"Pareamento: {msg or 'concluído'}")
+            self._wifi_log(
+                "Agora informe o IP:PORTA de CONEXÃO (tela principal da Depuração sem fio) e clique em Conectar."
+            )
+
+        self._quick_action("pair", self.btn_wifi_pair, fn, done)
+
+    @Slot()
     def connect_wifi(self) -> None:
         if not self.adb or self.wifi_state in ("connecting", "disconnecting"):
             return
@@ -2149,7 +2318,7 @@ class MainWindow(QMainWindow):
         self._set_wifi_state("connecting")
         attempt_id = secrets.token_hex(6)
         self.wifi_attempt_id = attempt_id
-        QTimer.singleShot(25000, lambda: self._wifi_connect_timeout(attempt_id))
+        QTimer.singleShot(45000, lambda: self._wifi_connect_timeout(attempt_id))
         self.wifi_last_error = None
 
         def fn() -> dict:
@@ -2245,6 +2414,7 @@ class MainWindow(QMainWindow):
         if self.wifi_state == "connecting":
             self._set_wifi_state("disconnected")
             self.wifi_last_error = "Timeout conectando via Wi‑Fi."
+            self.wifi_attempt_id = None  # descarta o resultado se chegar depois do aviso
             self._err_dialog("Timeout conectando via Wi‑Fi. Verifique IP:PORTA e a Depuração sem fio no aparelho.")
 
     def _wifi_monitor_tick(self) -> None:
@@ -2409,8 +2579,13 @@ class MainWindow(QMainWindow):
         p = QFileDialog.getExistingDirectory(self, "Pasta de capturas", str(self.output_dir))
         if not p:
             return
-        self.output_dir = Path(p)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        target = Path(p)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, f"Não foi possível usar a pasta:\n{target}\n\n{exc}")
+            return
+        self.output_dir = target
         self._sync_output_fields()
 
     def _sync_output_fields(self) -> None:
@@ -2420,22 +2595,34 @@ class MainWindow(QMainWindow):
             if w is not None:
                 w.setText(path)
 
-    def _ensure_output_dir(self) -> Path:
+    def _ensure_output_dir(self, source: str | None = None) -> Path | None:
+        """Pasta de saída do campo da aba de origem; None (com aviso) se não puder ser criada."""
         raw = ""
-        for attr in ("txt_out_gravar", "txt_out_print"):
+        attrs = ((source,) if source else ()) + ("txt_out_gravar", "txt_out_print")
+        for attr in attrs:
             w = getattr(self, attr, None)
             if w is not None and (w.text() or "").strip():
                 raw = (w.text() or "").strip()
                 break
-        if raw:
-            self.output_dir = Path(raw)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        target = Path(raw) if raw else self.output_dir
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                f"Não foi possível usar a pasta de saída:\n{target}\n\n{exc}",
+            )
+            return None
+        self.output_dir = target
         self._sync_output_fields()
-        return self.output_dir
+        return target
 
     @Slot()
     def _open_output_dir(self) -> None:
         out = self._ensure_output_dir()
+        if out is None:
+            return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(out)))
 
     @Slot()
@@ -2443,7 +2630,9 @@ class MainWindow(QMainWindow):
         serial = self._require_serial()
         if not serial or not self.adb:
             return
-        out_dir = self._ensure_output_dir()
+        out_dir = self._ensure_output_dir("txt_out_print")
+        if out_dir is None:
+            return
         out = out_dir / f"screenshot_{serial.replace(':', '_')}_{time.strftime('%Y%m%d_%H%M%S')}.png"
 
         def fn() -> str:
@@ -2454,7 +2643,28 @@ class MainWindow(QMainWindow):
         def ok(p: str) -> None:
             self._append(self.txt_print_out, f"Print salvo: {p}")
 
-        self.bg.run(fn, ok, self._err_dialog)
+        self._quick_action("print", self.btn_screenshot, fn, ok)
+
+    def _quick_action(self, key: str, btn, fn, ok) -> None:
+        """Roda uma ação curta em background com o botão desabilitado (sem duplo clique)."""
+        if key in self._quick_busy:
+            return
+        self._quick_busy.add(key)
+        btn.setEnabled(False)
+
+        def done() -> None:
+            self._quick_busy.discard(key)
+            btn.setEnabled(True)
+
+        def _ok(value) -> None:
+            done()
+            ok(value)
+
+        def _err(msg: str) -> None:
+            done()
+            self._err_dialog(msg)
+
+        self.bg.run(fn, _ok, _err)
 
     @Slot()
     def apply_dpi(self) -> None:
@@ -2462,6 +2672,17 @@ class MainWindow(QMainWindow):
         if not serial or not self.adb:
             return
         dpi = int(self.spn_dpi.value())
+        if dpi < 120 or dpi > 320:
+            ans = QMessageBox.question(
+                self,
+                APP_NAME,
+                f"DPI {dpi} está fora da faixa usual (120–320) e pode deixar a tela do aparelho "
+                "ilegível ou grande demais.\n\nAplicar mesmo assim? (Use «Restaurar» para voltar ao padrão.)",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
 
         def fn() -> str:
             assert self.adb is not None
@@ -2470,7 +2691,7 @@ class MainWindow(QMainWindow):
         def ok(msg: str) -> None:
             self._append(self.txt_dpi_out, msg)
 
-        self.bg.run(fn, ok, self._err_dialog)
+        self._quick_action("dpi", self.btn_dpi_apply, fn, ok)
 
     @Slot()
     def reset_dpi(self) -> None:
@@ -2485,7 +2706,7 @@ class MainWindow(QMainWindow):
         def ok(msg: str) -> None:
             self._append(self.txt_dpi_out, msg)
 
-        self.bg.run(fn, ok, self._err_dialog)
+        self._quick_action("dpi_reset", self.btn_dpi_reset, fn, ok)
 
     @Slot()
     def toggle_recording(self) -> None:
@@ -2502,9 +2723,7 @@ class MainWindow(QMainWindow):
         btn = self.btn_record_toggle
         busy = state in ("starting", "recording", "stopping")
         if hasattr(self, "chk_record_audio"):
-            self.chk_record_audio.setEnabled(not busy and self.cmb_mic.count() > 0 and not str(self.cmb_mic.itemText(0)).startswith("Nenhum"))
-            self.cmb_mic.setEnabled(not busy and self.chk_record_audio.isChecked())
-            self.btn_refresh_mics.setEnabled(not busy)
+            self.chk_record_audio.setEnabled(not busy)
         if state == "idle":
             btn.setEnabled(True)
             btn.setText("Iniciar gravação")
@@ -2540,120 +2759,72 @@ class MainWindow(QMainWindow):
         btn.setIcon(_nav_icon("fa5s.play", QStyle.SP_MediaPlay, QSize(18, 18), COLOR_ICON_ON_PRIMARY, self.style()))
         _repolish(btn)
 
-    @Slot()
-    def refresh_microphones(self) -> None:
-        if not hasattr(self, "cmb_mic"):
-            return
-        current_label = self.cmb_mic.currentText().strip()
-        current_data = self.cmb_mic.currentData()
-        self.cmb_mic.blockSignals(True)
-        self.cmb_mic.clear()
-        mics = list_microphones()
-        for mic in mics:
-            self.cmb_mic.addItem(mic.label, mic.dshow_name)
-        restored = False
-        if current_data:
-            for i in range(self.cmb_mic.count()):
-                if self.cmb_mic.itemData(i) == current_data:
-                    self.cmb_mic.setCurrentIndex(i)
-                    restored = True
-                    break
-        if not restored and current_label:
-            idx = self.cmb_mic.findText(current_label)
-            if idx >= 0:
-                self.cmb_mic.setCurrentIndex(idx)
-                restored = True
-        if not restored and self.cmb_mic.count() > 0:
-            self.cmb_mic.setCurrentIndex(0)
-        self.cmb_mic.blockSignals(False)
-
-        has_mics = self.cmb_mic.count() > 0
-        self.cmb_mic.setEnabled(has_mics and self.chk_record_audio.isChecked())
-        self.chk_record_audio.setEnabled(has_mics)
-        if not has_mics:
-            self.chk_record_audio.setChecked(False)
-            self.cmb_mic.addItem("Nenhum microfone detectado (verifique o FFmpeg)")
-            self.cmb_mic.setEnabled(False)
-            self._append(self.txt_gravar_out, "Nenhum microfone encontrado. Instale/verifique o FFmpeg para listar dispositivos DirectShow.")
-        self._on_record_audio_toggled(self.chk_record_audio.isChecked())
-
-    def _selected_mic(self) -> tuple[str, str] | None:
-        """Retorna (rótulo, nome dshow) ou None."""
-        if not hasattr(self, "cmb_mic") or self.cmb_mic.count() <= 0:
-            return None
-        label = self.cmb_mic.currentText().strip()
-        if not label or label.startswith("Nenhum microfone"):
-            return None
-        data = self.cmb_mic.currentData()
-        dshow = str(data).strip() if data else label
-        return label, dshow
-
-    def _on_record_audio_toggled(self, checked: bool) -> None:
-        if not hasattr(self, "cmb_mic"):
-            return
-        self.cmb_mic.setEnabled(bool(checked) and self.cmb_mic.count() > 0 and "Nenhum microfone" not in self.cmb_mic.currentText())
-
     def _stop_audio_recording(self) -> None:
         thr = self.audio_thread
-        if thr is None:
-            return
-        thr.stop()
-
-    def _cleanup_audio_thread(self) -> None:
-        thr = self.audio_thread
-        self.audio_thread = None
         if thr is not None:
-            thr.wait(8000)
+            thr.stop()
 
     @Slot()
     def start_recording(self) -> None:
-        if self.record_thread is not None or self.recording_state in ("starting", "stopping"):
+        if self.record_thread is not None or self.recording_state != "idle":
             return
         serial = self._require_serial()
         if not serial or not self.adb:
             return
-
-        want_audio = bool(self.chk_record_audio.isChecked())
-        mic = self._selected_mic() if want_audio else None
-        if want_audio and mic is None:
-            QMessageBox.warning(self, APP_NAME, "Selecione um microfone válido ou desmarque «Gravar áudio».")
+        out_dir = self._ensure_output_dir("txt_out_gravar")
+        if out_dir is None:
             return
 
+        want_audio = bool(self.chk_record_audio.isChecked())
         self._set_recording_state("starting")
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        base = self._ensure_output_dir() / f"record_{serial.replace(':', '_')}_{ts}"
-        out = Path(str(base) + ".mp4")
-        audio_out = Path(str(base) + ".wav") if want_audio else None
-        self._audio_out_path = audio_out
-        started_at = time.monotonic()
-        self.record_thread = ScreenRecordThread(
-            adb_path=self.adb.adb_path,
-            serial=serial,
-            out_path=out,
-            bit_rate=4000000,
-            size=None,
-            time_limit_s=180,
-            started_at=started_at,
-        )
-        self.record_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
-        self.record_thread.finished.connect(self._on_recording_finished)
-        self.record_thread.failed.connect(self._on_recording_failed)
+        try:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            base = out_dir / f"record_{serial.replace(':', '_')}_{ts}"
+            out = Path(str(base) + ".mp4")
+            audio_out = Path(str(base) + ".wav") if want_audio else None
+            started_at = time.monotonic()
+            self._record_started_at = started_at
+            self._audio_delay_s = 0.0
+            record_thread = ScreenRecordThread(
+                adb_path=self.adb.adb_path,
+                serial=serial,
+                out_path=out,
+                bit_rate=4000000,
+                size=None,
+                time_limit_s=180,
+                started_at=started_at,
+            )
+            record_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
+            record_thread.finished.connect(self._on_recording_finished)
+            record_thread.failed.connect(self._on_recording_failed)
 
-        if want_audio and audio_out is not None and mic is not None:
-            label, dshow_name = mic
-            self.audio_thread = MicRecordThread(dshow_name, audio_out, display_name=label)
-            self.audio_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
-            self.audio_thread.finished.connect(self._on_audio_finished)
-            self.audio_thread.failed.connect(self._on_audio_failed)
-            self.audio_thread.start()
+            audio_thread = None
+            if audio_out is not None:
+                audio_thread = DeviceAudioRecordThread(self.adb.adb_path, serial, audio_out)
+                audio_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
+                audio_thread.finished.connect(self._on_audio_finished)
+                audio_thread.failed.connect(self._on_audio_failed)
 
-        self.record_thread.start()
+            self.record_thread = record_thread
+            self.audio_thread = audio_thread
+            self._audio_out_path = audio_out
+            if audio_thread is not None:
+                audio_thread.start()
+            record_thread.start()
+        except Exception as e:
+            self.record_thread = None
+            self.audio_thread = None
+            self._audio_out_path = None
+            self._set_recording_state("idle")
+            self._err_dialog(f"Não foi possível iniciar a gravação: {e}")
+            return
+
         self._set_recording_state("recording")
         self._start_recording_ui(serial)
         if want_audio:
             self._append(
                 self.txt_gravar_out,
-                "Gravando vídeo + áudio… os arquivos serão salvos separados (.mp4 e .wav).",
+                "Gravando tela + áudio do Mini PC… o som HDMI entra no mesmo arquivo MP4.",
             )
         else:
             self._append(self.txt_gravar_out, "Gravando… clique em Parar gravação para encerrar.")
@@ -2663,7 +2834,7 @@ class MainWindow(QMainWindow):
         if self.record_thread is None or self.recording_state in ("idle", "starting", "stopping"):
             return
         self._set_recording_state("stopping")
-        # Encerra áudio e vídeo no mesmo instante
+        # Só sinaliza: cada thread encerra seus próprios processos (a UI não congela).
         self._stop_audio_recording()
         self.record_thread.stop()
         self._append(self.txt_gravar_out, "Encerrando gravação… aguarde a finalização dos arquivos.")
@@ -2672,41 +2843,122 @@ class MainWindow(QMainWindow):
     def _on_audio_finished(self, path: str) -> None:
         try:
             size = Path(path).stat().st_size
-            self._append(self.txt_gravar_out, f"Áudio salvo: {path} • {_fmt_bytes(size)}")
+            self._append(self.txt_gravar_out, f"Áudio do Mini PC capturado ({_fmt_bytes(size)}). Será mesclado no MP4.")
         except Exception:
-            self._append(self.txt_gravar_out, f"Áudio salvo: {path}")
+            self._append(self.txt_gravar_out, "Áudio do Mini PC capturado. Será mesclado no MP4.")
 
     @Slot()
     def _on_audio_failed(self, msg: str) -> None:
         self._append(self.txt_gravar_out, f"Áudio: {msg}")
 
+    def _finish_recording_ok(self, path: str, *, with_audio: bool) -> None:
+        self._set_recording_state("idle")
+        self._stop_recording_ui()
+        try:
+            size = Path(path).stat().st_size
+            prefix = "Vídeo com áudio salvo" if with_audio else "Vídeo salvo"
+            self._append(self.txt_gravar_out, f"{prefix}: {path} • {_fmt_bytes(size)}")
+        except Exception:
+            self._append(self.txt_gravar_out, f"Vídeo salvo: {path}")
+
+    def _mux_recorded_audio(self, video_path: str, audio_path: Path, audio_thr) -> None:
+        video = Path(video_path)
+        started = self._record_started_at
+        self._append(self.txt_gravar_out, "Finalizando áudio e mesclando no vídeo…")
+
+        def fn() -> tuple[str, str]:
+            # Espera fora da thread da UI o scrcpy fechar o WAV.
+            audio_thr.wait(25000)
+            if audio_thr.isRunning():
+                return "noaudio", "O áudio do Mini PC demorou para finalizar; o MP4 foi salvo sem o som do equipamento."
+            try:
+                has_audio = audio_path.exists() and audio_path.stat().st_size > 1024
+            except OSError:
+                has_audio = False
+            if not has_audio:
+                return "noaudio", "Áudio do Mini PC não ficou pronto; o MP4 foi salvo sem som do equipamento."
+            delay = 0.0
+            if audio_thr.audio_started_at is not None:
+                # ~0,6 s: tempo que o screenrecord leva até o primeiro quadro.
+                delay = max(0.0, audio_thr.audio_started_at - started - 0.6)
+            ffmpeg = _resolve_ffmpeg()
+            if not ffmpeg:
+                raise RuntimeError("FFmpeg não encontrado para incluir o áudio no MP4.")
+            tmp = video.with_name(video.stem + ".mux.mp4")
+            try:
+                ok, err = mux_audio_into_mp4(ffmpeg, video, audio_path, tmp, delay)
+                if not ok:
+                    raise RuntimeError(err or "Falha ao mesclar o áudio no vídeo.")
+                tmp.replace(video)
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            try:
+                audio_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return "muxed", str(video)
+
+        def ok(result: tuple[str, str]) -> None:
+            status, info = result
+            if status == "muxed":
+                self._finish_recording_ok(info, with_audio=True)
+                return
+            try:
+                audio_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            self._append(self.txt_gravar_out, info)
+            self._finish_recording_ok(video_path, with_audio=False)
+
+        def err(msg: str) -> None:
+            self._set_recording_state("idle")
+            self._stop_recording_ui()
+            self._append(self.txt_gravar_out, f"Vídeo salvo: {video_path}")
+            self._append(self.txt_gravar_out, f"Áudio separado (mescla falhou): {audio_path}")
+            self._append(self.txt_gravar_out, msg)
+
+        self.bg.run(fn, ok, err)
+
     @Slot()
     def _on_recording_finished(self, path: str) -> None:
         thread = self.record_thread
         self.record_thread = None
-        self._set_recording_state("idle")
-        self._stop_recording_ui()
-        if thread is not None:
-            thread.wait(5000)
-        # Garante encerramento do áudio se ainda estiver ativo
-        self._stop_audio_recording()
-        self._cleanup_audio_thread()
-        try:
-            size = Path(path).stat().st_size
-            self._append(self.txt_gravar_out, f"Vídeo salvo: {path} • {_fmt_bytes(size)}")
-        except Exception:
-            self._append(self.txt_gravar_out, f"Vídeo salvo: {path}")
+        self._retire_thread(thread)
+        audio_thr = self.audio_thread
+        self.audio_thread = None
+        audio_path = self._audio_out_path
+        self._audio_out_path = None
+        if audio_thr is None or audio_path is None:
+            self._finish_recording_ok(path, with_audio=False)
+            return
+        audio_thr.stop()
+        self._retire_thread(audio_thr)
+        self._set_recording_state("stopping")
+        self._mux_recorded_audio(path, audio_path, audio_thr)
 
     @Slot()
     def _on_recording_failed(self, msg: str) -> None:
         thread = self.record_thread
         self.record_thread = None
+        self._retire_thread(thread)
         self._set_recording_state("idle")
         self._stop_recording_ui()
-        if thread is not None:
-            thread.wait(5000)
-        self._stop_audio_recording()
-        self._cleanup_audio_thread()
+        audio_thr = self.audio_thread
+        self.audio_thread = None
+        audio_path = self._audio_out_path
+        self._audio_out_path = None
+        if audio_thr is not None:
+            audio_thr.stop()
+            self._retire_thread(audio_thr)
+            if audio_path is not None:
+                def cleanup() -> None:
+                    audio_thr.wait(20000)
+                    audio_path.unlink(missing_ok=True)
+
+                self.bg.run(cleanup, lambda _r: None, lambda _m: None)
         self._err_dialog(msg)
 
     @Slot()
@@ -2730,17 +2982,18 @@ class MainWindow(QMainWindow):
                     row.setText(entry.label)
                 else:
                     missing += 1
-                    row.setChecked(False)
+                    if row.isChecked():
+                        row.setChecked(False)
                     row.setEnabled(True)
                     row.toggle.setEnabled(False)
                     row.setToolTip(f"Arquivo ausente: {path.name}\nColoque o APK em {path.parent}")
                     row.setText(f"{entry.label}  (ausente)")
             self._update_apk_accordion_label(cat)
         self._sync_autostart_checkbox()
-        self._append(
-            self.txt_apps_out,
-            f"APKs prontos: {available} • ausentes: {missing} • pasta: {self.apks_dir}",
-        )
+        summary = f"APKs prontos: {available} • ausentes: {missing} • pasta: {self.apks_dir}"
+        if summary != self._last_apk_avail_msg:  # não repete a mesma linha a cada atualização
+            self._last_apk_avail_msg = summary
+            self._append(self.txt_apps_out, summary)
 
     def _set_apk_sync_busy(self, busy: bool) -> None:
         self._apk_sync_busy = busy
@@ -2772,6 +3025,8 @@ class MainWindow(QMainWindow):
 
     def _sync_apks_from_repo(self, *, only_missing: bool, silent_empty: bool) -> None:
         if self._apk_sync_busy or self._install_busy:
+            if not silent_empty and hasattr(self, "txt_apps_out"):
+                self._append(self.txt_apps_out, "Aguarde: já há download ou instalação de APKs em andamento.")
             return
         if not hasattr(self, "txt_apps_out"):
             return
@@ -2834,7 +3089,7 @@ class MainWindow(QMainWindow):
         if not entries:
             QMessageBox.warning(self, APP_NAME, "Ative ao menos um aplicativo disponível.")
             return
-        missing = [e for e in entries if not resolve_apk(e).exists()]
+        missing = [e for e in entries if not self._apk_present(e)]
         if missing:
             names = ", ".join(e.label for e in missing)
             tts = self._sintese_de_voz_entry()
@@ -2940,7 +3195,42 @@ class MainWindow(QMainWindow):
             has_post_install=self._install_post_pending,
         )
 
+    @staticmethod
+    def _apk_present(entry) -> bool:
+        try:
+            p = resolve_apk(entry)
+            return p.is_file() and p.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _guarded(self, cb, on_fatal):
+        """Envolve um callback de fila: exceção inesperada nunca deixa a UI travada."""
+        def wrapper(*args):
+            try:
+                cb(*args)
+            except Exception as exc:  # noqa: BLE001
+                on_fatal(exc)
+
+        return wrapper
+
+    def _install_fatal(self, exc: Exception) -> None:
+        self._append(self.txt_apps_out, f"Erro interno na fila de instalação: {exc}")
+        self._finish_install_queue(complete=False)
+
+    def _uninstall_fatal(self, exc: Exception) -> None:
+        self._append(self.txt_uninstall_out, f"Erro interno na desinstalação: {exc}")
+        self._uninstall_queue = []
+        self._uninstall_busy = False
+        self.btn_uninstall_refresh.setEnabled(True)
+        self.btn_uninstall_run.setEnabled(True)
+
     def _install_next_in_queue(self, serial: str) -> None:
+        try:
+            self._install_next_in_queue_impl(serial)
+        except Exception as exc:  # noqa: BLE001
+            self._install_fatal(exc)
+
+    def _install_next_in_queue_impl(self, serial: str) -> None:
         if not self._install_queue:
             need_tts = self._install_need_tts_config
             tts_apk_ok = self._install_tts_apk_ok
@@ -3021,7 +3311,11 @@ class MainWindow(QMainWindow):
                     self._append(self.txt_apps_out, f"Pós-instalação: falha — {msg}")
                     self._finish_install_queue(complete=False)
 
-                self.bg.run(post_fn, post_ok, post_err)
+                self.bg.run(
+                    post_fn,
+                    self._guarded(post_ok, self._install_fatal),
+                    self._guarded(post_err, self._install_fatal),
+                )
                 return
 
             if need_boot and not pkgs:
@@ -3092,7 +3386,11 @@ class MainWindow(QMainWindow):
             self._set_install_progress(self._install_progress_percent(), animate=True)
             self._install_next_in_queue(serial)
 
-        self.bg.run(fn, ok, err)
+        self.bg.run(
+            fn,
+            self._guarded(ok, self._install_fatal),
+            self._guarded(err, self._install_fatal),
+        )
 
     def _finish_install_queue(self, *, complete: bool = True) -> None:
         self._install_busy = False
@@ -3119,16 +3417,124 @@ class MainWindow(QMainWindow):
         """Compatível com testes/smoke: sem seleção, só valida dispositivo."""
         self.install_selected_apks()
 
+    def _cleanup_after_update(self) -> None:
+        if not is_frozen():
+            return
+        try:
+            from .updater import cleanup_old_backups, cleanup_update_leftovers, install_dir_for_update
+
+            install_dir = install_dir_for_update()
+            if install_dir is None:
+                return
+
+            def fn() -> None:
+                cleanup_update_leftovers(install_dir)
+                cleanup_old_backups(install_dir, keep=0)
+
+            self.bg.run(fn, lambda _r: None, lambda _m: None)
+        except Exception:
+            pass
+
+    def _retire_thread(self, thr) -> None:
+        """Mantém a referência de uma QThread até ela terminar de verdade (sem wait na UI)."""
+        if thr is None:
+            return
+        if thr not in self._retired_threads:
+            self._retired_threads.append(thr)
+        if not self._thread_reaper.isActive():
+            self._thread_reaper.start()
+
+    def _reap_threads(self) -> None:
+        self._retired_threads = [t for t in self._retired_threads if t.isRunning()]
+        if not self._retired_threads:
+            self._thread_reaper.stop()
+
+    def _active_operations(self) -> list[str]:
+        ops: list[str] = []
+        if self.recording_state != "idle" or self.record_thread is not None:
+            ops.append("gravação de tela")
+        if self._install_busy:
+            ops.append("instalação de APKs")
+        if self._uninstall_busy:
+            ops.append("desinstalação")
+        if self._optimize_busy:
+            ops.append("otimização")
+        if self._factory_reset_busy:
+            ops.append("restauração de fábrica")
+        if getattr(self, "_update_busy", False):
+            ops.append("atualização do app")
+        return ops
+
+    def _shutdown_work(self) -> None:
+        """Encerra timers, logcat e gravação (síncrono; usado ao fechar o app)."""
+        for t in (self.wifi_monitor_timer, self.recording_timer):
+            try:
+                t.stop()
+            except Exception:
+                pass
+        try:
+            self.stop_logcat()
+        except Exception:
+            pass
+        threads = [t for t in (self.record_thread, self.audio_thread) if t is not None]
+        for t in threads:
+            try:
+                t.stop()
+            except Exception:
+                pass
+        for t in threads + list(self._retired_threads):
+            try:
+                if not t.wait(35000):
+                    t.terminate()
+                    t.wait(2000)
+            except Exception:
+                pass
+        self.record_thread = None
+        self.audio_thread = None
+        self._retired_threads.clear()
+        try:
+            self.bg.wait_idle(3000)
+        except Exception:
+            pass
+
+    def _device_busy(self) -> str | None:
+        """Descrição da operação em andamento que impede ações destrutivas, ou None."""
+        if self.recording_state != "idle" or self.record_thread is not None:
+            return "uma gravação de tela"
+        if self._install_busy:
+            return "uma instalação de APK"
+        if self._uninstall_busy:
+            return "uma desinstalação"
+        if self._optimize_busy:
+            return "uma otimização"
+        if self._factory_reset_busy:
+            return "uma restauração de fábrica"
+        return None
+
+    def _adb_restart_unsafe(self) -> bool:
+        """True enquanto reiniciar o servidor ADB derrubaria uma operação em curso."""
+        return self._device_busy() is not None or self.logcat_thread is not None
+
     @Slot()
     def start_factory_reset(self) -> None:
         serial = self._require_serial()
         if not serial or not self.adb:
             return
+        busy = self._device_busy()
+        if busy:
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                f"Há {busy} em andamento. Aguarde terminar antes de restaurar o aparelho.",
+            )
+            return
+        dev = self._selected_device()
+        dev_label = dev.label if dev else serial
 
         confirm = QMessageBox.warning(
             self,
             APP_NAME,
-            "Atenção: a restauração de fábrica apaga TODOS os dados do dispositivo "
+            f"Atenção: a restauração de fábrica apaga TODOS os dados do dispositivo\n«{dev_label}» ({serial}) "
             "e não pode ser desfeita.\n\nDeseja continuar?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -3139,13 +3545,14 @@ class MainWindow(QMainWindow):
         typed, ok = QInputDialog.getText(
             self,
             "Confirmar restauração",
-            "Digite RESET para confirmar a restauração de fábrica:",
+            f"Digite RESET para apagar «{dev_label}» ({serial}):",
         )
         if not ok or typed.strip().upper() != "RESET":
             QMessageBox.information(self, APP_NAME, "Restauração cancelada.")
             return
 
         self.btn_factory_reset.setEnabled(False)
+        self._factory_reset_busy = True
         self._append(self.txt_reset_out, f"Iniciando restauração de fábrica em {serial}…")
         self._append(
             self.txt_reset_out,
@@ -3157,6 +3564,7 @@ class MainWindow(QMainWindow):
             return self.adb.factory_reset(serial)
 
         def ok_cb(result: tuple[str, bool]) -> None:
+            self._factory_reset_busy = False
             msg, should_disconnect = result
             self._append(self.txt_reset_out, msg)
             if should_disconnect:
@@ -3176,20 +3584,9 @@ class MainWindow(QMainWindow):
             self.btn_factory_reset.setEnabled(True)
 
         def err_cb(msg: str) -> None:
+            self._factory_reset_busy = False
             self.btn_factory_reset.setEnabled(True)
-            # Queda de ADB no meio do wipe = sucesso esperado, não erro crítico
-            if Adb._looks_like_device_gone((msg or "").lower()):
-                warn = (
-                    "A conexão com o Mini PC foi perdida porque a restauração de fábrica foi iniciada.\n\n"
-                    "Isso é esperado: o aparelho apaga os dados e reinicia. "
-                    "Quando ele voltar, reconecte em Conectar e atualize a lista."
-                )
-                self._append(self.txt_reset_out, warn)
-                if msg.strip():
-                    self._append(self.txt_reset_out, f"(Detalhe ADB: {msg.strip()})")
-                self._after_factory_reset(serial)
-                QMessageBox.warning(self, APP_NAME, warn)
-                return
+            # factory_reset() já confirma a queda real do aparelho; erro aqui = falha de verdade.
             self._append(self.txt_reset_out, f"Falha: {msg}")
             self._err_dialog(msg)
 
@@ -3264,31 +3661,43 @@ class MainWindow(QMainWindow):
             self._err_dialog(str(e))
             return
 
-        self.logcat_thread = LogcatThread(popen)
-        self.logcat_thread.line.connect(lambda ln: self._append(self.txt_logcat, ln))
-        self.logcat_thread.failed.connect(self._err_dialog)
-        self.logcat_thread.stopped.connect(lambda: setattr(self, "logcat_thread", None))
-        self.logcat_thread.start()
+        thr = LogcatThread(popen)
+        self.logcat_thread = thr
+        thr.line.connect(lambda ln: self._append(self.txt_logcat, ln))
+        thr.failed.connect(self._err_dialog)
+        thr.stopped.connect(lambda t=thr: self._on_logcat_stopped(t))
+        thr.start()
+
+    def _on_logcat_stopped(self, thr) -> None:
+        # Só zera se ainda for a thread atual (um "stopped" atrasado não pode soltar a nova).
+        if self.logcat_thread is thr:
+            self.logcat_thread = None
 
     @Slot()
     def stop_logcat(self) -> None:
-        if self.logcat_thread is None:
+        thr = self.logcat_thread
+        if thr is None:
             return
-        self.logcat_thread.stop()
-        self.logcat_thread.wait(1500)
         self.logcat_thread = None
+        thr.stop()
+        self._retire_thread(thr)
 
     def closeEvent(self, event) -> None:
-        try:
-            self.stop_logcat()
-        except Exception:
-            pass
-        try:
-            self.stop_recording()
-        except Exception:
-            pass
-        try:
-            self.bg.wait_idle(2000)
-        except Exception:
-            pass
+        if not self._closing:
+            ops = self._active_operations()
+            if ops:
+                ans = QMessageBox.question(
+                    self,
+                    APP_NAME,
+                    "Há operação em andamento: " + ", ".join(ops) + ".\n\n"
+                    "Sair agora interrompe o processo (uma gravação em curso é finalizada e salva).\n"
+                    "Deseja sair mesmo assim?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if ans != QMessageBox.Yes:
+                    event.ignore()
+                    return
+            self._closing = True
+        self._shutdown_work()
         super().closeEvent(event)

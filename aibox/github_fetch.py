@@ -7,6 +7,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlparse
 
 from .theme import APP_VERSION
 
@@ -26,6 +27,68 @@ _RELEASE_DOWNLOAD_RE = re.compile(
     rf"^https://github.com/{re.escape(GITHUB_REPO)}/releases/download/"
     r"(?P<tag>[^/]+)/(?P<name>[^/?#]+)"
 )
+
+
+# Só HTTPS e só estes hosts (inclui os redirecionamentos do GitHub para os assets).
+ALLOWED_HOSTS = frozenset(
+    {
+        "github.com",
+        "api.github.com",
+        "raw.githubusercontent.com",
+        "media.githubusercontent.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "cdn.jsdelivr.net",
+    }
+)
+MAX_JSON_BYTES = 2 * 1024 * 1024  # manifestos e respostas da API
+MAX_APK_BYTES = 300 * 1024 * 1024
+MAX_UPDATE_BYTES = 800 * 1024 * 1024
+
+
+def is_allowed_url(url: str) -> bool:
+    try:
+        p = urlparse((url or "").strip())
+    except ValueError:
+        return False
+    return p.scheme == "https" and (p.hostname or "").lower() in ALLOWED_HOSTS
+
+
+def check_url(url: str) -> str:
+    """Levanta URLError se a URL não for HTTPS de um host permitido."""
+    if not is_allowed_url(url):
+        host = ""
+        try:
+            host = urlparse(url).hostname or ""
+        except ValueError:
+            pass
+        raise urllib.error.URLError(f"URL não permitida (somente HTTPS do GitHub): {host or url!r}")
+    return url
+
+
+class _AllowedRedirect(urllib.request.HTTPRedirectHandler):
+    """Rejeita redirecionamento para fora da allowlist ou com downgrade para HTTP."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        check_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+urllib.request.install_opener(urllib.request.build_opener(_AllowedRedirect))
+
+
+def safe_urlopen(req, timeout: float):  # noqa: ANN001
+    """urlopen restrito: HTTPS + allowlist, inclusive nos redirecionamentos."""
+    check_url(getattr(req, "full_url", str(req)))
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def read_limited(resp, max_bytes: int) -> bytes:  # noqa: ANN001
+    """Lê a resposta inteira recusando corpos maiores que max_bytes."""
+    data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise urllib.error.URLError("Resposta maior que o limite permitido.")
+    return data
 
 
 class RemoteFetchError(Exception):
@@ -74,8 +137,11 @@ def relative_from_url(url: str) -> str:
     return ""
 
 
-def releases_mirror_urls(url: str) -> list[str]:
-    """URLs alternativas do mesmo arquivo no ReleasesAibox."""
+def releases_mirror_urls(url: str, *, include_cdn: bool = True) -> list[str]:
+    """URLs alternativas do mesmo arquivo no ReleasesAibox.
+
+    `include_cdn=False` omite o jsDelivr (cache mutável de terceiros): use para manifestos.
+    """
     target = (url or "").strip()
     if not target:
         return []
@@ -89,7 +155,11 @@ def releases_mirror_urls(url: str) -> list[str]:
     relative = relative_from_url(target)
     if relative:
         for prefix in RELEASES_PREFIXES:
+            if not include_cdn and "cdn.jsdelivr.net" in prefix:
+                continue
             _add(prefix + relative)
+    if not include_cdn:
+        ordered = [u for u in ordered if "cdn.jsdelivr.net" not in u]
     return ordered
 
 
@@ -113,8 +183,8 @@ def github_api_file(relative: str, *, timeout_s: float) -> bytes:
     req_meta = urllib.request.Request(
         url, headers=ua_headers("application/vnd.github+json"), method="GET"
     )
-    with urllib.request.urlopen(req_meta, timeout=timeout_s) as resp:
-        meta = json.loads(resp.read().decode("utf-8"))
+    with safe_urlopen(req_meta, timeout_s) as resp:
+        meta = json.loads(read_limited(resp, MAX_JSON_BYTES).decode("utf-8"))
     if not isinstance(meta, dict):
         raise RemoteFetchError(f"Resposta inválida da API do GitHub para {relative}.")
     encoding = str(meta.get("encoding") or "")
@@ -128,8 +198,8 @@ def github_api_file(relative: str, *, timeout_s: float) -> bytes:
             blob_url, headers=ua_headers("application/vnd.github.raw"), method="GET"
         )
         try:
-            with urllib.request.urlopen(req_blob, timeout=timeout_s) as resp:
-                data = resp.read()
+            with safe_urlopen(req_blob, timeout_s) as resp:
+                data = read_limited(resp, MAX_APK_BYTES)
                 if data:
                     return data
         except Exception:
@@ -138,8 +208,8 @@ def github_api_file(relative: str, *, timeout_s: float) -> bytes:
             blob_url, headers=ua_headers("application/vnd.github+json"), method="GET"
         )
         try:
-            with urllib.request.urlopen(req_blob_json, timeout=timeout_s) as resp:
-                blob = json.loads(resp.read().decode("utf-8"))
+            with safe_urlopen(req_blob_json, timeout_s) as resp:
+                blob = json.loads(read_limited(resp, MAX_APK_BYTES * 2).decode("utf-8"))
             if isinstance(blob, dict) and blob.get("encoding") == "base64":
                 raw = str(blob.get("content") or "")
                 if raw.strip():
@@ -151,8 +221,8 @@ def github_api_file(relative: str, *, timeout_s: float) -> bytes:
         req_dl = urllib.request.Request(
             download, headers=ua_headers("*/*"), method="GET"
         )
-        with urllib.request.urlopen(req_dl, timeout=timeout_s) as resp:
-            return resp.read()
+        with safe_urlopen(req_dl, timeout_s) as resp:
+            return read_limited(resp, MAX_APK_BYTES)
     raise RemoteFetchError(f"Não foi possível baixar {relative} via API do GitHub.")
 
 
@@ -168,8 +238,8 @@ def github_release_asset_url(url: str, *, timeout_s: float) -> str | None:
         api, headers=ua_headers("application/vnd.github+json"), method="GET"
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        with safe_urlopen(req, timeout_s) as resp:
+            payload = json.loads(read_limited(resp, MAX_JSON_BYTES).decode("utf-8"))
     except Exception:
         return None
     assets = payload.get("assets") if isinstance(payload, dict) else None
@@ -190,7 +260,7 @@ def http_get(url: str, *, timeout_s: float, accept: str) -> tuple[bytes, str]:
     http_codes: list[int] = []
     last_http: urllib.error.HTTPError | None = None
     last_reason: object | None = None
-    for candidate in releases_mirror_urls(url):
+    for candidate in releases_mirror_urls(url, include_cdn=False):
         req = urllib.request.Request(
             candidate,
             headers=ua_headers(accept),
@@ -198,8 +268,8 @@ def http_get(url: str, *, timeout_s: float, accept: str) -> tuple[bytes, str]:
         )
         for attempt in range(2):
             try:
-                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                    return resp.read(), candidate
+                with safe_urlopen(req, timeout_s) as resp:
+                    return read_limited(resp, MAX_JSON_BYTES), candidate
             except urllib.error.HTTPError as e:
                 last_http = e
                 http_codes.append(e.code)

@@ -61,5 +61,6 @@ class Background:
         self.pool.start(w)
 
     def wait_idle(self, timeout_ms: int = 3000) -> None:
-        self.pool.waitForDone(timeout_ms)
-        self._active.clear()
+        # Só solta as referências se todos terminaram: Worker não tem auto-delete.
+        if self.pool.waitForDone(timeout_ms):
+            self._active.clear()

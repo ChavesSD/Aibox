@@ -10,6 +10,14 @@ build/
 .venv/
 venv/
 .env
+.env.*
+
+# Certificados e chaves (nunca versionar)
+*.pfx
+*.p12
+*.pem
+*.key
+*.snk
 
 # APKs (não entram no repositório de código)
 Apks/
@@ -18,6 +26,7 @@ Apks/
 # Ícone nativo (não gerar a partir do PNG — fica desfalcado na barra de tarefas)
 aibox/platform-tools/*.exe
 aibox/platform-tools/*.dll
+aibox/scrcpy/
 
 # IDE / OS
 .idea/

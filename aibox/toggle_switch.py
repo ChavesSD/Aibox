@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPropertyAnimation, QEasingCurve, QRectF, Qt, Property, QSize
-from PySide6.QtGui import QColor, QPainter, QPainterPath
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QAbstractButton, QWidget, QHBoxLayout, QLabel, QSizePolicy
 
 from .theme import COLOR_BORDER, COLOR_DISABLED, COLOR_PRIMARY, COLOR_SURFACE_2, COLOR_SUBTLE, COLOR_TEXT
@@ -83,7 +83,29 @@ class ToggleSwitch(QAbstractButton):
         p.setPen(Qt.NoPen)
         p.setBrush(thumb)
         p.drawEllipse(thumb_rect)
+
+        if self.hasFocus() and enabled:
+            # Anel de foco: navegação por teclado (Tab/Espaço) precisa ser visível.
+            ring = QColor(COLOR_TEXT)
+            ring.setAlpha(210)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(ring, 2))
+            p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 13, 13)
         p.end()
+
+
+class _ClickableLabel(QLabel):
+    """Rótulo que repassa o clique ao switch ao lado."""
+
+    def __init__(self, text: str, target: ToggleSwitch, parent: QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self._target = target
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.LeftButton and self._target.isEnabled() and self.rect().contains(event.position().toPoint()):
+            self._target.toggle()
+        super().mouseReleaseEvent(event)
 
 
 class ToggleRow(QWidget):
@@ -96,7 +118,7 @@ class ToggleRow(QWidget):
         lay.setContentsMargins(2, 0, 2, 0)
         lay.setSpacing(8)
         self.toggle = ToggleSwitch()
-        self.label = QLabel(text)
+        self.label = _ClickableLabel(text, self.toggle)
         self.label.setObjectName("ToggleRowLabel")
         self.label.setWordWrap(False)
         self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)

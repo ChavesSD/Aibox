@@ -15,10 +15,13 @@ from pathlib import Path
 from typing import Callable
 
 from .github_fetch import (
+    MAX_UPDATE_BYTES,
     RemoteFetchError,
     github_release_asset_url,
     http_get,
+    is_allowed_url,
     releases_mirror_urls,
+    safe_urlopen,
     ua_headers,
 )
 from .paths import executable_dir, is_frozen
@@ -106,6 +109,9 @@ def is_newer(remote: str, current: str) -> bool:
 
 
 def manifest_url() -> str:
+    # No app empacotado a origem do manifesto é fixa (a env var serviria para redirecionar a atualização).
+    if is_frozen():
+        return DEFAULT_UPDATE_MANIFEST_URL
     return (os.environ.get("AIBOX_UPDATE_MANIFEST_URL") or DEFAULT_UPDATE_MANIFEST_URL).strip()
 
 
@@ -114,6 +120,10 @@ def updates_dir() -> Path:
     d = base / APP_DIR_NAME / "updates"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_ASSET_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,120}\.zip")
 
 
 def parse_manifest(data: dict) -> UpdateManifest:
@@ -126,11 +136,19 @@ def parse_manifest(data: dict) -> UpdateManifest:
         )
         asset_raw = data["asset"]
         asset = ReleaseAsset(
-            name=str(asset_raw["name"]),
-            url=str(asset_raw["url"]),
+            name=str(asset_raw["name"]).strip(),
+            url=str(asset_raw["url"]).strip(),
             sha256=str(asset_raw["sha256"]).lower().strip(),
             size=int(asset_raw.get("size") or 0),
         )
+        if not _ASSET_NAME_RE.fullmatch(asset.name):
+            raise UpdateError(f"Manifesto inválido: nome de pacote suspeito {asset.name!r}.")
+        if not _SHA256_RE.fullmatch(asset.sha256):
+            raise UpdateError("Manifesto inválido: sha256 ausente ou malformado (obrigatório).")
+        if not is_allowed_url(asset.url):
+            raise UpdateError("Manifesto inválido: o pacote deve ser HTTPS do repositório de releases.")
+        if asset.size < 0 or asset.size > MAX_UPDATE_BYTES:
+            raise UpdateError("Manifesto inválido: tamanho do pacote fora do limite.")
         return UpdateManifest(
             version=str(data["version"]).lstrip("v"),
             notes=notes,
@@ -230,18 +248,27 @@ def _stream_url_to_file(
     size_hint: int,
     progress: ProgressCb | None,
     timeout_s: float,
+    max_bytes: int = MAX_UPDATE_BYTES,
+    deadline_s: float | None = None,
 ) -> None:
     req = urllib.request.Request(url, headers=ua_headers("*/*"), method="GET")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+    started = time.monotonic()
+    with safe_urlopen(req, timeout_s) as resp:
         total = int(resp.headers.get("Content-Length") or size_hint or 0)
+        if total and total > max_bytes:
+            raise UpdateError("O arquivo anunciado excede o tamanho máximo permitido.")
         downloaded = 0
         with partial.open("wb") as out:
             while True:
+                if deadline_s is not None and time.monotonic() - started > deadline_s:
+                    raise UpdateError("O download excedeu o tempo máximo permitido.")
                 block = resp.read(256 * 1024)
                 if not block:
                     break
-                out.write(block)
                 downloaded += len(block)
+                if downloaded > max_bytes:
+                    raise UpdateError("O download excedeu o tamanho máximo permitido.")
+                out.write(block)
                 if progress:
                     progress(downloaded, total)
 
@@ -252,7 +279,15 @@ def download_asset(
     *,
     progress: ProgressCb | None = None,
     timeout_s: float = 60.0,
+    expected_sha256: str | None = None,
+    max_bytes: int | None = None,
+    deadline_s: float | None = 1800.0,
 ) -> Path:
+    """Baixa para `.part`, valida o checksum ANTES de substituir o destino e então troca (atômico)."""
+    if max_bytes is None:
+        max_bytes = MAX_UPDATE_BYTES
+        if asset.size:
+            max_bytes = min(max_bytes, int(asset.size * 1.1) + 1024 * 1024)
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_suffix(dest.suffix + ".part")
     if partial.exists():
@@ -269,6 +304,8 @@ def download_asset(
                     size_hint=asset.size,
                     progress=progress,
                     timeout_s=timeout_s,
+                    max_bytes=max_bytes,
+                    deadline_s=deadline_s,
                 )
                 last_error = None
                 break
@@ -277,6 +314,9 @@ def download_asset(
                 if e.code == 429 and attempt == 0:
                     time.sleep(1.5)
                     continue
+                break
+            except UpdateError as e:
+                last_error = e
                 break
             except urllib.error.URLError as e:
                 last_error = UpdateError(f"Falha no download: {e.reason}")
@@ -298,6 +338,8 @@ def download_asset(
                     size_hint=asset.size,
                     progress=progress,
                     timeout_s=timeout_s,
+                    max_bytes=max_bytes,
+                    deadline_s=deadline_s,
                 )
                 last_error = None
             except Exception as e:
@@ -311,6 +353,16 @@ def download_asset(
             pass
         raise last_error
 
+    expected = (expected_sha256 or "").strip()
+    if expected:
+        try:
+            verify_sha256(partial, expected)
+        except Exception:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise
     partial.replace(dest)
     if progress and asset.size:
         progress(asset.size, asset.size)
@@ -330,10 +382,22 @@ def stage_update_package(
     *,
     progress: ProgressCb | None = None,
 ) -> Path:
-    dest = updates_dir() / manifest.asset.name
-    download_asset(manifest.asset, dest, progress=progress, timeout_s=300.0)
-    if manifest.asset.sha256:
-        verify_sha256(dest, manifest.asset.sha256)
+    name = Path(manifest.asset.name).name
+    if not _ASSET_NAME_RE.fullmatch(name) or not _SHA256_RE.fullmatch(manifest.asset.sha256.lower()):
+        raise UpdateError("Pacote de atualização sem nome/checksum válidos.")
+    base = updates_dir().resolve()
+    dest = (base / name).resolve()
+    if dest.parent != base:
+        raise UpdateError("Nome de pacote inválido.")
+    # O checksum é verificado no .part antes de qualquer substituição.
+    download_asset(
+        manifest.asset,
+        dest,
+        progress=progress,
+        timeout_s=300.0,
+        expected_sha256=manifest.asset.sha256,
+        deadline_s=3600.0,
+    )
     return dest
 
 
@@ -350,6 +414,7 @@ def helper_argv(
     install_dir: Path,
     package: Path,
     restart: bool = True,
+    sha256: str | None = None,
 ) -> list[str]:
     args = [
         sys.executable,
@@ -361,6 +426,8 @@ def helper_argv(
         "--package",
         str(package),
     ]
+    if sha256:
+        args += ["--sha256", sha256]
     if restart:
         args.append("--restart")
     return args
@@ -372,8 +439,11 @@ def launch_update_helper(
     install_dir: Path,
     package: Path,
     restart: bool = True,
+    sha256: str | None = None,
 ) -> None:
-    args = helper_argv(pid=pid, install_dir=install_dir, package=package, restart=restart)
+    args = helper_argv(
+        pid=pid, install_dir=install_dir, package=package, restart=restart, sha256=sha256
+    )
     creationflags = 0
     if sys.platform == "win32":
         # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
@@ -430,6 +500,28 @@ def _escape(text: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def cleanup_update_leftovers(install_dir: Path, *, max_age_s: float = 86400.0) -> None:
+    """Remove pastas temporárias de atualizações interrompidas (.extract-*, .new-*)."""
+    parent = install_dir.parent
+    name = install_dir.name
+    now = time.time()
+    for pattern in (f"{name}.extract-*", f"{name}.new-*"):
+        try:
+            candidates = list(parent.glob(pattern))
+        except OSError:
+            continue
+        for old in candidates:
+            try:
+                if now - old.stat().st_mtime < max_age_s:
+                    continue
+                if old.is_dir():
+                    shutil.rmtree(old, ignore_errors=True)
+                else:
+                    old.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def cleanup_old_backups(install_dir: Path, *, keep: int = 1) -> None:

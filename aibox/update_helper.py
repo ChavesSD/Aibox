@@ -11,6 +11,7 @@ este processo sair, troca as pastas e relança o app.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 import subprocess
@@ -19,8 +20,24 @@ import time
 import zipfile
 from pathlib import Path
 
+from .ziputil import safe_extract_zip
+
 _CREATE_NO_WINDOW = 0x08000000
 _DETACHED = 0x00000008 | 0x00000200 | _CREATE_NO_WINDOW
+
+
+def _system32(exe: str) -> str:
+    """Caminho absoluto de uma ferramenta do Windows (evita binary planting via PATH/cwd)."""
+    windir = os.environ.get("SystemRoot") or r"C:\Windows"
+    return str(Path(windir) / "System32" / exe)
+
+
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
 
 
 def _log(package: Path, message: str) -> None:
@@ -39,7 +56,7 @@ def _pid_alive(pid: int) -> bool:
     if sys.platform == "win32":
         try:
             out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                [_system32("tasklist.exe"), "/FI", f"PID eq {pid}", "/NH"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -72,7 +89,7 @@ def _stop_locking_helpers() -> None:
         return
     try:
         subprocess.run(
-            ["taskkill", "/F", "/IM", "adb.exe", "/T"],
+            [_system32("taskkill.exe"), "/F", "/IM", "adb.exe", "/T"],
             capture_output=True,
             timeout=8,
             creationflags=_CREATE_NO_WINDOW,
@@ -105,7 +122,7 @@ def stage_new_onedir(package: Path, install_dir: Path) -> Path:
     staging.mkdir(parents=True, exist_ok=True)
 
     with zipfile.ZipFile(package, "r") as zf:
-        zf.extractall(staging)
+        safe_extract_zip(zf, staging)
 
     payload = _payload_from_extract(staging)
     if payload.resolve() == staging.resolve():
@@ -166,6 +183,7 @@ def _write_swap_script(
     new_q = _vbs_quote(str(new_dir))
     backup_q = _vbs_quote(str(install_dir.parent / f"{install_dir.name}.bak-{helper_pid}"))
     exe_q = _vbs_quote(str(install_dir / "Aibox.exe"))
+    taskkill_q = _vbs_quote(_system32("taskkill.exe") + " /F /IM adb.exe /T")
     log_q = _vbs_quote(str(script_dir / "aibox-swap.log"))
     pid = int(helper_pid)
     restart_block = (
@@ -204,7 +222,7 @@ def _write_swap_script(
                 "  WScript.Sleep 400",
                 "Loop",
                 "WScript.Sleep 800",
-                'sh.Run "taskkill /F /IM adb.exe /T", 0, True',
+                f"sh.Run {taskkill_q}, 0, True",
                 "WScript.Sleep 1500",
                 "n = 0",
                 "Do",
@@ -230,11 +248,8 @@ def _write_swap_script(
                 "  WScript.Quit 1",
                 "End If",
                 restart_block,
-                f"If fso.FolderExists({backup_q}) Then",
-                "  On Error Resume Next",
-                f"  fso.DeleteFolder {backup_q}, True",
-                "  On Error GoTo 0",
-                "End If",
+                # O backup fica ao lado da instalação: o app novo o apaga depois de rodar com
+                # sucesso (cleanup_old_backups). Se o novo não abrir, a pasta .bak-* tem a versão antiga.
                 'LogLine "swap-ok"',
                 "On Error Resume Next",
                 "fso.DeleteFile WScript.ScriptFullName, True",
@@ -279,6 +294,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--install-dir", type=Path, required=True)
     parser.add_argument("--package", type=Path, required=True)
     parser.add_argument("--restart", action="store_true")
+    parser.add_argument("--sha256", default="")
     args = parser.parse_args(argv)
 
     install_dir = args.install_dir.resolve()
@@ -288,10 +304,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Pacote não encontrado: {package}", file=sys.stderr)
         return 2
 
+    expected = (args.sha256 or "").strip().lower()
     try:
+        if expected:
+            # Revalida logo antes de extrair: o ZIP ficou numa pasta gravável pelo usuário.
+            if _sha256_of(package) != expected:
+                _log(package, "checksum do pacote não confere — atualização abortada")
+                print("Checksum do pacote não confere.", file=sys.stderr)
+                return 3
         _log(package, f"aguardando pid {args.pid}")
         _wait_pid(args.pid)
         _stop_locking_helpers()
+        if expected and _sha256_of(package) != expected:
+            _log(package, "checksum do pacote mudou durante a espera — atualização abortada")
+            return 3
         _log(package, "extraindo pacote")
         new_dir = stage_new_onedir(package, install_dir)
         script = _write_swap_script(

@@ -115,9 +115,11 @@ def _default_adb_candidates() -> list[Path]:
         roots.append(exe_dir / "_internal" / "aibox")
         roots.append(exe_dir / "_internal")
         roots.append(exe_dir)
-    roots.extend([here, here.parent, exe_dir, cwd])
+    roots.extend([here, here.parent, exe_dir])
     for sdk in _sdk_platform_tools_roots():
         roots.append(sdk.parent if sdk.name == "platform-tools" else sdk)
+    if not is_frozen():
+        roots.append(cwd)  # nunca no app empacotado: um adb.exe plantado na pasta atual seria executado
 
     seen: set[str] = set()
     for base in roots:
@@ -217,7 +219,7 @@ def ensure_adb_usb_ini() -> bool:
     ini = android_user_home() / "adb_usb.ini"
     existing: list[str] = []
     if ini.is_file():
-        existing = [ln.strip() for ln in ini.read_text(encoding="utf-8", errors="replace").splitlines()]
+        existing = [ln.strip() for ln in ini.read_text(encoding="utf-8-sig", errors="replace").splitlines()]
     have = {ln.lower() for ln in existing if ln and not ln.startswith("#")}
     missing = [v for v in _ADB_EXTRA_VIDS if v.lower() not in have]
     if not missing and ini.is_file():
@@ -228,6 +230,73 @@ def ensure_adb_usb_ini() -> bool:
     lines.extend(missing)
     ini.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return True
+
+
+_PACKAGE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+")
+_COMPONENT_RE = re.compile(r"[A-Za-z0-9_$.]+(?:/[A-Za-z0-9_$.]+)?")
+
+
+def is_valid_package_name(name: str | None) -> bool:
+    """Nome de pacote Android seguro para interpolar em `adb shell`."""
+    return bool(name) and _PACKAGE_RE.fullmatch(name or "") is not None
+
+
+def is_valid_component(name: str | None) -> bool:
+    return bool(name) and _COMPONENT_RE.fullmatch(name or "") is not None
+
+
+# Marcadores em que o comando NÃO chegou a rodar: repetir é seguro.
+_SERVER_RETRY_SAFE_MARKERS = (
+    "does not match this client",
+    "cannot connect to daemon",
+    "daemon not running",
+    "failed to start daemon",
+    "cannot start server",
+)
+# Marcadores ambíguos (o comando pode ter rodado): só repete operações idempotentes.
+_SERVER_RETRY_AMBIGUOUS_MARKERS = (
+    "protocol fault",
+    "couldn't read status",
+    "connection reset",
+)
+_IDEMPOTENT_ADB_COMMANDS = frozenset(
+    {"devices", "get-state", "connect", "disconnect", "version", "start-server", "kill-server", "pair"}
+)
+
+# Pacotes que nunca podem ser desinstalados pelo app (quebrariam o aparelho).
+_BLOCKED_UNINSTALL_EXACT = frozenset(
+    {
+        "android",
+        "com.google.android.gms",
+        "com.google.android.gsf",
+        "com.google.android.tvlauncher",
+        "com.google.android.apps.tv.launcherx",
+        "com.google.android.permissioncontroller",
+        "com.google.android.packageinstaller",
+    }
+)
+_BLOCKED_UNINSTALL_PREFIXES = ("com.android.", "android.")
+# Pacotes sensíveis do kiosk/totem: permitidos só com confirmação reforçada.
+_SENSITIVE_UNINSTALL = frozenset(
+    {
+        "com.autostart",
+        "com.droidlogic.app.Autostart",
+        "com.android.autostart",
+        "com.softwinner.autostart",
+        "com.android.rockchip.autostart",
+        "com.google.android.tts",
+    }
+)
+
+
+def uninstall_protection(package: str) -> str:
+    """'blocked' (não desinstala), 'sensitive' (confirmação reforçada) ou ''."""
+    pkg = (package or "").strip()
+    if pkg in _SENSITIVE_UNINSTALL:
+        return "sensitive"
+    if pkg in _BLOCKED_UNINSTALL_EXACT or pkg.startswith(_BLOCKED_UNINSTALL_PREFIXES):
+        return "blocked"
+    return ""
 
 
 _SERVER_RETRY_MARKERS = (
@@ -247,6 +316,8 @@ class Adb:
         self.adb_path = adb_path or find_adb()
         self._adb_dir = str(Path(self.adb_path).resolve().parent)
         self._display_blanked = False
+        # Callback opcional: devolve True quando reiniciar o servidor ADB derrubaria algo em curso.
+        self.restart_guard = None
         self._ensure_server()
 
     def _adb_env(self) -> dict[str, str]:
@@ -280,13 +351,30 @@ class Adb:
             stderr = err.decode("utf-8", "replace")
         return f"{stdout}\n{stderr}"
 
-    def _needs_server_restart(self, cp: subprocess.CompletedProcess) -> bool:
+    def _needs_server_restart(
+        self, cp: subprocess.CompletedProcess, args: list[str] | None = None
+    ) -> bool:
         text = self._decode_cp(cp).lower()
         if "does not match this client" in text:
             return True
         if cp.returncode == 0:
             return False
-        return any(m in text for m in _SERVER_RETRY_MARKERS)
+        if any(m in text for m in _SERVER_RETRY_SAFE_MARKERS):
+            return True
+        # Erros ambíguos: não reexecuta install/uninstall/shell (não idempotentes).
+        if args and args[0] in _IDEMPOTENT_ADB_COMMANDS:
+            return any(m in text for m in _SERVER_RETRY_AMBIGUOUS_MARKERS)
+        return False
+
+    def _server_restart_allowed(self) -> bool:
+        """False enquanto houver operação longa (gravação, instalação…) usando o servidor."""
+        guard = self.restart_guard
+        if guard is None:
+            return True
+        try:
+            return not guard()
+        except Exception:
+            return True
 
     def _ensure_server(self) -> None:
         os.environ["ANDROID_USER_HOME"] = str(android_user_home())
@@ -339,7 +427,7 @@ class Adb:
         except subprocess.TimeoutExpired as e:
             raise AdbError(f"Timeout executando: {shlex.join(cmd)}") from e
 
-        if retry_server and self._needs_server_restart(cp):
+        if retry_server and self._needs_server_restart(cp, args) and self._server_restart_allowed():
             self._restart_server()
             return self._run(
                 args,
@@ -404,7 +492,7 @@ class Adb:
                 mode = allwinner_mode()
             except Exception:
                 mode = None
-            if mode in ("adb", "composite"):
+            if mode in ("adb", "composite") and self._server_restart_allowed():
                 try:
                     self._restart_server()
                     cp = self._run(["devices", "-l"], timeout_s=15, check=False)
@@ -492,127 +580,41 @@ class Adb:
         cp = self._run(args, timeout_s=20)
         return str(cp.stdout).strip()
 
+    def _screencap_bytes(self, serial: str, timeout_s: float, max_bytes: int) -> bytes:
+        """`adb exec-out screencap -p` com timeout REAL (mata o adb se o aparelho travar)."""
+        cmd = [self.adb_path, "-s", serial, "exec-out", "screencap", "-p"]
+        try:
+            cp = subprocess.run(cmd, timeout=timeout_s, **self._run_kwargs())
+        except FileNotFoundError as e:
+            raise AdbError(f"ADB inválido: {self.adb_path}") from e
+        except subprocess.TimeoutExpired as e:
+            raise AdbError(f"Timeout executando: {shlex.join(cmd)}") from e
+        if cp.returncode != 0:
+            err = (cp.stderr or b"").decode("utf-8", "replace").strip()
+            raise AdbError(err or f"Erro executando: {shlex.join(cmd)}")
+        data = cp.stdout or b""
+        if len(data) > max_bytes:
+            raise AdbError(f"Captura excedeu {max_bytes // (1024 * 1024)}MB.")
+        return data
+
     def screenshot_png(self, serial: str, out_path: Path) -> Path:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-        cmd = [self.adb_path, "-s", serial, "exec-out", "screencap", "-p"]
         try:
-            p = popen_hidden(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                cwd=self._adb_dir,
-                env=self._adb_env(),
-            )
-        except FileNotFoundError as e:
-            raise AdbError(f"ADB inválido: {self.adb_path}") from e
-
-        try:
-            assert p.stdout is not None
-            with tmp.open("wb") as f:
-                while True:
-                    chunk = p.stdout.read(1024 * 64)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            p.wait(timeout=30)
-        except subprocess.TimeoutExpired as e:
-            try:
-                p.kill()
-            except Exception:
-                pass
-            raise AdbError(f"Timeout executando: {shlex.join(cmd)}") from e
+            data = self._screencap_bytes(serial, timeout_s=30, max_bytes=60 * 1024 * 1024)
+            if not data:
+                raise AdbError("Falha ao capturar print: saída vazia do ADB.")
+            tmp.write_bytes(data)
+            tmp.replace(out_path)
         finally:
-            try:
-                if p.stdout:
-                    p.stdout.close()
-            except Exception:
-                pass
-
-        stderr = b""
-        try:
-            if p.stderr:
-                stderr = p.stderr.read() or b""
-        finally:
-            try:
-                if p.stderr:
-                    p.stderr.close()
-            except Exception:
-                pass
-
-        if p.returncode != 0:
-            msg = (stderr or b"").decode("utf-8", "replace").strip() or f"Erro executando: {shlex.join(cmd)}"
             try:
                 tmp.unlink(missing_ok=True)
-            except Exception:
+            except OSError:
                 pass
-            raise AdbError(msg)
-
-        try:
-            if not tmp.exists() or tmp.stat().st_size <= 0:
-                raise AdbError("Falha ao capturar print: saída vazia do ADB.")
-        except OSError:
-            raise AdbError("Falha ao capturar print: não foi possível validar o arquivo gerado.")
-
-        tmp.replace(out_path)
         return out_path
 
     def screencap_png_bytes(self, serial: str, timeout_s: int = 10) -> bytes:
-        cmd = [self.adb_path, "-s", serial, "exec-out", "screencap", "-p"]
-        try:
-            p = popen_hidden(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-                bufsize=0,
-                cwd=self._adb_dir,
-                env=self._adb_env(),
-            )
-        except FileNotFoundError as e:
-            raise AdbError(f"ADB inválido: {self.adb_path}") from e
-
-        out = bytearray()
-        try:
-            assert p.stdout is not None
-            while True:
-                chunk = p.stdout.read(1024 * 64)
-                if not chunk:
-                    break
-                out.extend(chunk)
-                if len(out) > 25 * 1024 * 1024:
-                    raise AdbError("Preview muito grande: captura excedeu 25MB.")
-            p.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired as e:
-            try:
-                p.kill()
-            except Exception:
-                pass
-            raise AdbError(f"Timeout executando: {shlex.join(cmd)}") from e
-        finally:
-            try:
-                if p.stdout:
-                    p.stdout.close()
-            except Exception:
-                pass
-
-        stderr = b""
-        try:
-            if p.stderr:
-                stderr = p.stderr.read() or b""
-        finally:
-            try:
-                if p.stderr:
-                    p.stderr.close()
-            except Exception:
-                pass
-
-        if p.returncode != 0:
-            msg = (stderr or b"").decode("utf-8", "replace").strip() or f"Erro executando: {shlex.join(cmd)}"
-            raise AdbError(msg)
-
-        data = bytes(out)
+        data = self._screencap_bytes(serial, timeout_s=timeout_s, max_bytes=25 * 1024 * 1024)
         if not data:
             raise AdbError("Preview: sem dados.")
         return data
@@ -675,10 +677,10 @@ class Adb:
                     "update_incompatible",
                     "signatures",
                     "inconsistent certificates",
-                    "version downgrade",
-                    "already exists",
                 )
             ):
+                # Só aqui o dado do TTS (vozes baixadas) precisa ser sacrificado: assinatura diferente.
+                notes.append("Assinatura diferente: reinstalando o Google TTS (vozes serão baixadas de novo).")
                 self.shell_try(
                     serial,
                     "pm uninstall --user 0 com.google.android.tts",
@@ -728,7 +730,7 @@ class Adb:
                 )
                 text = (cp.stdout or b"").decode("utf-8", "replace")
                 m = re.search(r"package:\s*name='([^']+)'", text)
-                if m:
+                if m and is_valid_package_name(m.group(1).strip()):
                     return m.group(1).strip()
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -762,7 +764,7 @@ class Adb:
     def launchable_component(self, serial: str, package: str) -> str | None:
         """Retorna package/activity lançável (LEANBACK_LAUNCHER ou LAUNCHER)."""
         package = (package or "").strip()
-        if not package:
+        if not package or not is_valid_package_name(package):
             return None
         for category in (
             "android.intent.category.LEANBACK_LAUNCHER",
@@ -827,7 +829,7 @@ class Adb:
             line = line.strip()
             if line.startswith("package:"):
                 pkg = line.split(":", 1)[-1].strip()
-                if pkg and pkg not in pkgs:
+                if is_valid_package_name(pkg) and pkg not in pkgs:
                     pkgs.insert(0, pkg)
         return pkgs
 
@@ -1002,6 +1004,10 @@ class Adb:
         lines: list[str],
     ) -> bool:
 
+        pkgs = [p for p in pkgs if is_valid_package_name(p)]
+        if not pkgs:
+            lines.append("Nenhum nome de pacote válido para configurar o autoinício.")
+            return False
         primary = pkgs[0]
         primary_label = labels.get(primary, primary)
         self.shell_try(
@@ -1021,6 +1027,9 @@ class Adb:
         if primary_comp and "/" in primary_comp:
             primary_activity_raw = primary_comp.split("/", 1)[1]
         primary_activity = self._fq_activity_class(primary, primary_activity_raw or "")
+        if primary_activity and not is_valid_component(primary_activity):
+            lines.append("Activity com nome inválido ignorada.")
+            primary_activity = ""
 
         if primary_activity:
             self.shell_try(
@@ -1801,6 +1810,7 @@ class Adb:
                 "echo WA=$(settings get global window_animation_scale); "
                 "echo TA=$(settings get global transition_animation_scale); "
                 "echo AA=$(settings get global animator_duration_scale); "
+                "echo STAY=$(settings get global stay_on_while_plugged_in); "
                 "settings put system screen_brightness_mode 0; "
                 "settings put system screen_brightness 0; "
                 "settings put global window_animation_scale 0; "
@@ -1836,6 +1846,8 @@ class Adb:
                 state["global:transition_animation_scale"] = line.split("=", 1)[-1].strip()
             elif line.startswith("AA="):
                 state["global:animator_duration_scale"] = line.split("=", 1)[-1].strip()
+            elif line.startswith("STAY="):
+                state["stay_on"] = line.split("=", 1)[-1].strip()
             elif line.startswith("FB|"):
                 _, path, val = (line.split("|", 2) + ["", ""])[:3]
                 if path:
@@ -1852,7 +1864,11 @@ class Adb:
     def _tts_restore_display(self, serial: str, state: dict[str, str]) -> None:
         """Restaura brilho/HDMI após a sessão silenciosa."""
         self._display_blanked = False
-        parts = ["svc power stayon false"]
+        stay = ((state or {}).get("stay_on") or "").strip()
+        if re.fullmatch(r"[0-9]{1,2}", stay):
+            parts = [f"settings put global stay_on_while_plugged_in {stay}"]  # valor ORIGINAL
+        else:
+            parts = ["svc power stayon false"]
         settings_keys = (
             "system:screen_brightness",
             "system:screen_brightness_mode",
@@ -1865,7 +1881,7 @@ class Adb:
             val = (state or {}).get(compound, "")
             if not val or val.lower() == "null":
                 continue
-            if ":" not in compound:
+            if ":" not in compound or not re.fullmatch(r"[0-9.\-]{1,12}", val):
                 continue
             ns, key = compound.split(":", 1)
             parts.append(f"settings put {ns} {key} {val}")
@@ -1873,13 +1889,11 @@ class Adb:
         if not restored_settings:
             parts.append("settings put system screen_brightness 128")
         for key, val in (state or {}).items():
-            if key.startswith("fb:") and val:
+            if key.startswith(("fb:", "bl:")) and val:
                 path = key[3:]
-                parts.append(f"echo {val} > {path} 2>/dev/null")
-            elif key.startswith("bl:") and val:
-                path = key[3:]
-                parts.append(f"echo {val} > {path} 2>/dev/null")
-            elif key == "disp_blank" and val:
+                if re.fullmatch(r"[0-9]{1,6}", val) and re.fullmatch(r"/sys/[A-Za-z0-9_./:@-]+", path):
+                    parts.append(f"echo {val} > {path} 2>/dev/null")
+            elif key == "disp_blank" and re.fullmatch(r"[0-9]{1,6}", val or ""):
                 parts.append(
                     f"echo {val} > /sys/class/disp/disp/attr/blank 2>/dev/null"
                 )
@@ -2903,7 +2917,7 @@ class Adb:
             if not line.startswith("package:"):
                 continue
             pkg = line.split(":", 1)[-1].strip()
-            if pkg:
+            if is_valid_package_name(pkg):
                 return pkg
         return None
 
@@ -3146,8 +3160,12 @@ class Adb:
 
     def uninstall_package(self, serial: str, package_name: str, keep_data: bool = False) -> str:
         package_name = (package_name or "").strip()
-        if not package_name:
+        if not is_valid_package_name(package_name):
             raise AdbError("Package name inválido.")
+        if uninstall_protection(package_name) == "blocked":
+            raise AdbError(
+                f"{package_name} é um componente essencial do Android e não pode ser desinstalado pelo Aibox."
+            )
         args = ["uninstall"]
         if keep_data:
             args.append("-k")
@@ -3200,7 +3218,7 @@ class Adb:
             if not line.startswith("package:"):
                 continue
             pkg = line.split("package:", 1)[1].strip()
-            if pkg:
+            if is_valid_package_name(pkg):
                 pkgs.append(pkg)
         return pkgs
 
@@ -3234,7 +3252,10 @@ class Adb:
         missing = [p for p in packages if not result[p].get("label")]
         # aapt no host: só para terceiros sem label (sistema costuma ter só labelRes)
         third_set = set(self._list_package_names(serial, third_party_only=True))
-        for pkg in [p for p in missing if p in third_set][:40]:
+        budget_end = time.monotonic() + 90.0  # orçamento total: a lista nunca "trava" por minutos
+        for pkg in [p for p in missing if p in third_set][:15]:
+            if time.monotonic() > budget_end:
+                break
             label = self._label_via_aapt(serial, pkg)
             if label:
                 result[pkg]["label"] = label
@@ -3365,7 +3386,7 @@ class Adb:
             "/sdcard/Android/obb/.cache "
             "2>/dev/null"
         )
-        out = self.shell_lax(serial, cmd, timeout_s=60)
+        out = self._shell_lax_soft(serial, cmd, timeout_s=60)
         return self._parse_du_kb(out), out
 
     def _optimize_dexopt(self, serial: str) -> tuple[bool, str]:
@@ -3378,7 +3399,18 @@ class Adb:
         ]
         notes: list[str] = []
         for cmd, timeout in attempts:
-            out = self.shell_lax(serial, cmd, timeout_s=timeout)
+            try:
+                out = self.shell_lax(serial, cmd, timeout_s=timeout)
+            except AdbError as exc:
+                low_err = str(exc).lower()
+                if "timeout" in low_err:
+                    # O dexopt continua rodando no aparelho: não dispara outro em paralelo.
+                    notes.append(
+                        f"`{cmd}` excedeu {timeout}s (pode seguir em segundo plano no aparelho)."
+                    )
+                    return False, "\n".join(notes)
+                notes.append(f"Falhou `{cmd}`: {exc}")
+                continue
             text = (out or "").strip()
             low = text.lower()
             failed = any(
@@ -3403,18 +3435,25 @@ class Adb:
         )
         return False, "\n".join(notes)
 
-    def optimize_device(self, serial: str) -> str:
+    def _shell_lax_soft(self, serial: str, cmd: str, timeout_s: int | None = 60) -> str:
+        """shell_lax que nunca levanta: timeout/queda viram texto no relatório (não perdem o resumo)."""
+        try:
+            return self.shell_lax(serial, cmd, timeout_s=timeout_s)
+        except AdbError as exc:
+            return f"[falha: {str(exc)[:160]}]"
+
+    def optimize_device(self, serial: str, *, deep_clean: bool = False) -> str:
         """Otimização completa (cache, armazenamento, RAM, diagnóstico) sem apagar dados do usuário."""
         import time
 
         lines: list[str] = ["=== Diagnóstico inicial ==="]
-        df_before = self.shell_lax(serial, "df -k /data 2>/dev/null | tail -n +2", timeout_s=15)
-        storage_before_h = self.shell_lax(
+        df_before = self._shell_lax_soft(serial, "df -k /data 2>/dev/null | tail -n +2", timeout_s=15)
+        storage_before_h = self._shell_lax_soft(
             serial,
             "df -h /data /sdcard /storage/emulated/0 2>/dev/null | head -n 20",
             timeout_s=20,
         )
-        mem_before = self.shell_lax(
+        mem_before = self._shell_lax_soft(
             serial,
             "cat /proc/meminfo | grep -E 'MemTotal|MemFree|MemAvailable|Cached|Buffers'",
             timeout_s=10,
@@ -3436,7 +3475,7 @@ class Adb:
 
         # 1) Limpar caches de apps (seguro — não apaga dados)
         lines.append("\n=== Limpeza de cache de apps ===")
-        trim = self.shell_lax(serial, "pm trim-caches 512G", timeout_s=120)
+        trim = self._shell_lax_soft(serial, "pm trim-caches 512G", timeout_s=120)
         trim_txt = (trim or "").strip()
         trim_low = trim_txt.lower()
         if any(s in trim_low for s in ("exception", "error", "unknown command", "denied")):
@@ -3449,21 +3488,25 @@ class Adb:
         # 2) Arquivos temporários / lixo comum (sem tocar em fotos/docs do usuário)
         lines.append("\n=== Limpeza de temporários ===")
         cleanup_targets = [
-            ("/data/local/tmp", "tmp local"),
             ("/sdcard/LOST.DIR", "LOST.DIR"),
-            ("/sdcard/.trash", "lixeira oculta"),
-            ("/sdcard/Trash", "Trash"),
             ("/sdcard/Android/data/*/cache", "cache apps (sdcard)"),
             ("/sdcard/Android/data/*/code_cache", "code_cache (sdcard)"),
             ("/sdcard/Android/obb/.cache", "obb cache"),
         ]
+        if deep_clean:
+            # Opt-in: pode apagar scripts/binários de provisionamento e arquivos da lixeira.
+            cleanup_targets[:0] = [
+                ("/data/local/tmp", "tmp local"),
+                ("/sdcard/.trash", "lixeira oculta"),
+                ("/sdcard/Trash", "Trash"),
+            ]
         for path, label in cleanup_targets:
             before = self._parse_du_kb(
-                self.shell_lax(serial, f"du -sk {path} 2>/dev/null", timeout_s=30)
+                self._shell_lax_soft(serial, f"du -sk {path} 2>/dev/null", timeout_s=30)
             )
-            self.shell_lax(serial, f"rm -rf {path}/* {path}/.[!.]* {path}/..?* 2>/dev/null", timeout_s=45)
+            self._shell_lax_soft(serial, f"rm -rf {path}/* {path}/.[!.]* {path}/..?* 2>/dev/null", timeout_s=45)
             after = self._parse_du_kb(
-                self.shell_lax(serial, f"du -sk {path} 2>/dev/null", timeout_s=30)
+                self._shell_lax_soft(serial, f"du -sk {path} 2>/dev/null", timeout_s=30)
             )
             freed = max(0, before - after)
             if before <= 0 and after <= 0:
@@ -3476,7 +3519,7 @@ class Adb:
 
         # 3) Liberar RAM — encerra processos em background
         lines.append("\n=== Otimização de memória RAM ===")
-        kill = self.shell_lax(serial, "am kill-all", timeout_s=30)
+        kill = self._shell_lax_soft(serial, "am kill-all", timeout_s=30)
         kill_txt = (kill or "").strip()
         if kill_txt and any(s in kill_txt.lower() for s in ("exception", "error", "unknown")):
             lines.append(f"AVISO am kill-all: {kill_txt[:240]}")
@@ -3485,7 +3528,7 @@ class Adb:
             lines.append(kill_txt or "am kill-all enviado (encerra apps em 2º plano).")
             results["ram"] = "ok"
         # drop_caches exige root
-        drop = self.shell_lax(
+        drop = self._shell_lax_soft(
             serial,
             "su 0 sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || "
             "su -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || echo drop_caches_sem_root",
@@ -3506,7 +3549,7 @@ class Adb:
 
         # 5) Busca de erros recentes (ANR / FATAL)
         lines.append("\n=== Análise de erros recentes ===")
-        crash = self.shell_lax(
+        crash = self._shell_lax_soft(
             serial,
             "logcat -d -t 400 *:E 2>/dev/null | grep -iE 'FATAL EXCEPTION|ANR in|OutOfMemory|am_crash|lowmemory' | tail -n 40",
             timeout_s=40,
@@ -3533,18 +3576,21 @@ class Adb:
             lines.append("Nenhum FATAL/ANR recente encontrado no buffer de log.")
             results["log"] = "limpo"
 
-        self.shell_lax(serial, "logcat -c", timeout_s=10)
-        lines.append("Buffer de logcat limpo.")
+        if deep_clean:
+            self._shell_lax_soft(serial, "logcat -c", timeout_s=10)
+            lines.append("Buffer de logcat limpo.")
+        else:
+            lines.append("Buffer de logcat mantido (diagnóstico preservado).")
 
         # 6) Snapshot final + deltas reais
         lines.append("\n=== Resultado ===")
-        df_after = self.shell_lax(serial, "df -k /data 2>/dev/null | tail -n +2", timeout_s=15)
-        storage_after_h = self.shell_lax(
+        df_after = self._shell_lax_soft(serial, "df -k /data 2>/dev/null | tail -n +2", timeout_s=15)
+        storage_after_h = self._shell_lax_soft(
             serial,
             "df -h /data /sdcard /storage/emulated/0 2>/dev/null | head -n 20",
             timeout_s=20,
         )
-        mem_after = self.shell_lax(
+        mem_after = self._shell_lax_soft(
             serial,
             "cat /proc/meminfo | grep -E 'MemTotal|MemFree|MemAvailable|Cached|Buffers'",
             timeout_s=10,
@@ -3601,7 +3647,13 @@ class Adb:
         lines.append(f"• dexopt: {results.get('dexopt', '?')}")
         lines.append(f"• análise de log: {results.get('log', '?')}")
         lines.append(
-            "\nDados do usuário (fotos, docs, apps) foram preservados. "
+            "\nNenhuma foto, documento ou app foi removido. "
+            + (
+                "Limpeza profunda: /data/local/tmp, lixeiras e logcat foram esvaziados. "
+                if deep_clean
+                else "/data/local/tmp, lixeiras e logcat foram mantidos. "
+            )
+            + 
             "Sem root, caches internos de /data/data podem não mudar no df — "
             "mesmo assim o trim-caches e o kill-all atuam no sistema."
         )
@@ -3623,7 +3675,7 @@ class Adb:
             try:
                 on_reset = self._is_factory_reset_screen(serial)
             except AdbError as e:
-                if self._looks_like_device_gone(str(e).lower()):
+                if self._connection_dropped_by_reset(serial, str(e)):
                     return (
                         "Restauração iniciada. A conexão caiu durante o reset (comportamento esperado).",
                         True,
@@ -3633,7 +3685,7 @@ class Adb:
                 try:
                     confirmed = self._confirm_factory_reset_on_ui(serial)
                 except AdbError as e:
-                    if self._looks_like_device_gone(str(e).lower()):
+                    if self._connection_dropped_by_reset(serial, str(e)):
                         return (
                             "Restauração iniciada. A conexão caiu durante o reset (comportamento esperado).",
                             True,
@@ -3651,7 +3703,7 @@ class Adb:
                     False,
                 )
         except AdbError as e:
-            if self._looks_like_device_gone(str(e).lower()):
+            if self._connection_dropped_by_reset(serial, str(e)):
                 return (
                     "Restauração iniciada. A conexão caiu durante o reset (comportamento esperado).",
                     True,
@@ -3672,7 +3724,7 @@ class Adb:
             except AdbError as e:
                 msg = str(e)
                 low = msg.lower()
-                if self._looks_like_device_gone(low) and "permission" not in low:
+                if "permission" not in low and self._connection_dropped_by_reset(serial, msg):
                     return (
                         "Restauração iniciada. O dispositivo desconectou durante o processo (comportamento esperado).",
                         True,
@@ -3814,28 +3866,27 @@ class Adb:
         return has_reset_word and has_wipe_hint
 
     def _confirm_factory_reset_on_ui(self, serial: str) -> bool:
-        """Confirma wipe via DPAD em 1–2 telas Leanback (Redefinir → Apagar tudo).
+        """Confirma o wipe via DPAD (Redefinir → Apagar tudo), validando o foco antes de cada ENTER.
 
-        Caminho rápido: no máximo 1 dump por tela; DOWN+CENTER sem revalidar com dump.
-        Nestes Mini PCs «Cancelar» inicia focado — um DOWN chega em «Redefinir»/«Apagar tudo».
+        Só pressiona ENTER quando o item focado é um rótulo de confirmação conhecido;
+        se o foco for «Cancelar» desce UMA vez e relê o foco. Rótulo desconhecido = aborta.
         """
         import time
 
-        for _ in range(2):
+        for _ in range(3):
             if self._wait_device_offline(serial, timeout_s=0.2):
                 return True
 
             label = self._focused_action_label(serial)
-            if self._is_wipe_confirm_label(label):
-                # Já no botão certo → só confirma
-                self.shell_lax(serial, "input keyevent 23", timeout_s=3)
-            else:
-                # Cancelar (padrão) → desce e confirma no mesmo shell (sem dump entre eles)
-                self.shell_lax(
-                    serial,
-                    "input keyevent 20; sleep 0.2; input keyevent 23",
-                    timeout_s=4,
-                )
+            if not self._is_wipe_confirm_label(label):
+                if not self._is_cancel_label(label):
+                    return False  # tela inesperada: não arrisca apertar ENTER
+                self.shell_lax(serial, "input keyevent 20", timeout_s=3)
+                time.sleep(0.25)
+                label = self._focused_action_label(serial)
+                if not self._is_wipe_confirm_label(label):
+                    return False
+            self.shell_lax(serial, "input keyevent 23", timeout_s=3)
 
             # Próxima tela aparece rápido; wipe pode derrubar o ADB
             if self._wait_device_offline(serial, timeout_s=2.5):
@@ -3845,13 +3896,12 @@ class Adb:
         return self._wait_device_offline(serial, timeout_s=20.0)
 
     def _leanback_focus_and_confirm(self, serial: str) -> bool:
-        """Compat: uma confirmação Leanback rápida."""
+        """Compat: confirma uma vez, apenas se o foco estiver em rótulo de confirmação."""
         label = self._focused_action_label(serial)
         if self._is_wipe_confirm_label(label):
             self.shell_lax(serial, "input keyevent 23", timeout_s=3)
             return True
-        self.shell_lax(serial, "input keyevent 20; sleep 0.2; input keyevent 23", timeout_s=4)
-        return True
+        return False
 
     @staticmethod
     def _is_cancel_label(label: str | None) -> bool:
@@ -4081,7 +4131,7 @@ class Adb:
         return ("starting:" in low) or ("start success" in low) or ("status: ok" in low)
 
     def _wait_device_offline(self, serial: str, *, timeout_s: float = 18.0) -> bool:
-        """True se o device sumir/ficar offline após o comando de wipe."""
+        """True só se o aparelho sumir da lista ou ficar offline (nunca por erro do ADB)."""
         import time
 
         deadline = time.monotonic() + timeout_s
@@ -4089,11 +4139,13 @@ class Adb:
             try:
                 devices = self.list_devices()
             except AdbError:
-                return True
+                # Falha do servidor ADB não prova que o aparelho caiu: tenta de novo.
+                time.sleep(0.5)
+                continue
             match = next((d for d in devices if d.serial == serial), None)
             if match is None:
                 return True
-            if match.state != "device":
+            if match.state not in ("device", "unauthorized"):
                 return True
             # Poll rápido — evita shell ping a cada ciclo (muito lento no Wi‑Fi)
             time.sleep(0.35)
@@ -4110,16 +4162,17 @@ class Adb:
                 "error: connection",
                 "connection reset",
                 "connection refused",
-                "cannot connect",
                 "no devices/emulators",
-                "not found",
-                "offline",
-                "disconnected",
                 "protocol fault",
                 "remote end closed",
-                "timeout executando",
             )
         )
+
+    def _connection_dropped_by_reset(self, serial: str, err_text: str) -> bool:
+        """Erro com cara de queda de conexão E aparelho realmente offline."""
+        if not self._looks_like_device_gone((err_text or "").lower()):
+            return False
+        return self._wait_device_offline(serial, timeout_s=12.0)
 
     @staticmethod
     def _factory_reset_output_failed(out: str) -> bool:

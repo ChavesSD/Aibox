@@ -75,15 +75,15 @@ class TestManifest(unittest.TestCase):
             "notes": {"added": ["A"], "fixed": ["B"], "removed": []},
             "asset": {
                 "name": "Aibox-windows-x64-1.2.0.zip",
-                "url": "https://example.com/a.zip",
-                "sha256": "abc",
+                "url": "https://github.com/ChavesSD/ReleasesAibox/releases/download/v1.2.0/a.zip",
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "size": 10,
             },
         }
         m = parse_manifest(data)
         self.assertEqual(m.version, "1.2.0")
         self.assertEqual(m.notes.added, ["A"])
-        self.assertEqual(m.asset.url, "https://example.com/a.zip")
+        self.assertEqual(m.asset.url, "https://github.com/ChavesSD/ReleasesAibox/releases/download/v1.2.0/a.zip")
 
 
 class TestApksManifest(unittest.TestCase):
@@ -98,9 +98,9 @@ class TestApksManifest(unittest.TestCase):
                     "category": "Totem",
                     "filename": "Upzz.apk",
                     "label": "Upzz",
-                    "sha256": "abc",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "size": 10,
-                    "url": "https://example.com/Totem-Upzz.apk",
+                    "url": "https://raw.githubusercontent.com/ChavesSD/ReleasesAibox/main/apk_assets/Totem-Upzz.apk",
                 }
             ],
         }

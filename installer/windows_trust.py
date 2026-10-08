@@ -9,6 +9,13 @@ from pathlib import Path
 CREATE_NO_WINDOW = 0x08000000
 
 
+def powershell_exe() -> str:
+    """powershell.exe por caminho absoluto (evita binary planting via PATH/cwd)."""
+    windir = os.environ.get("SystemRoot") or r"C:\Windows"
+    p = Path(windir) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(p) if p.is_file() else "powershell"
+
+
 def unblock_file(path: Path) -> None:
     """Apaga o ADS Zone.Identifier (marca de arquivo baixado da internet)."""
     if os.name != "nt":
@@ -30,7 +37,7 @@ def unblock_tree(root: Path) -> None:
     try:
         subprocess.run(
             [
-                "powershell",
+                powershell_exe(),
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
@@ -56,7 +63,7 @@ def add_defender_exclusion(path: Path) -> None:
     try:
         subprocess.run(
             [
-                "powershell",
+                powershell_exe(),
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",

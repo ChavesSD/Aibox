@@ -61,7 +61,13 @@ class PageHeader(QWidget):
         self._fade.finished.connect(self._on_fade_finished)
 
     def set_texts(self, title: str, subtitle: str, *, animate: bool = True) -> None:
-        if title == self.lbl_title.text() and subtitle == self.lbl_sub.text():
+        # Compara com o destino atual (o que está sendo mostrado OU o que já está pendente):
+        # voltar à página original durante o fade não pode deixar o texto errado.
+        target = self._pending if self._pending is not None else (
+            self.lbl_title.text(),
+            self.lbl_sub.text(),
+        )
+        if (title, subtitle) == target:
             return
 
         if not animate:

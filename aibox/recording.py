@@ -221,6 +221,58 @@ def _mp4_is_playable(path: Path) -> bool:
     return d is not None and d > 0.2
 
 
+def _has_audio_stream(path: Path) -> bool:
+    """True se o arquivo tiver ao menos uma faixa de áudio."""
+    ffprobe = _resolve_ffprobe()
+    if not ffprobe or not path.exists():
+        return False
+    cmd = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "json",
+        str(path),
+    ]
+    cp = run_hidden(cmd, capture_output=True, text=True, timeout=20)
+    if cp.returncode != 0:
+        return False
+    try:
+        obj = json.loads(cp.stdout or "{}")
+    except Exception:
+        return False
+    streams = obj.get("streams") if isinstance(obj, dict) else None
+    if not isinstance(streams, list):
+        return False
+    return any(
+        isinstance(s, dict) and str(s.get("codec_type") or "").lower() == "audio" for s in streams
+    )
+
+
+def _try_ffmpeg_cmds(cmds: list[list[str]], dst: Path) -> tuple[bool, str]:
+    last_err = ""
+    for cmd in cmds:
+        try:
+            if dst.exists():
+                dst.unlink(missing_ok=True)
+        except Exception:
+            pass
+        cp = run_hidden(cmd, capture_output=True, text=True, timeout=300)
+        if cp.returncode == 0 and _mp4_is_playable(dst):
+            return True, ""
+        last_err = (cp.stderr or cp.stdout or "").strip()
+        try:
+            if dst.exists():
+                dst.unlink(missing_ok=True)
+        except Exception:
+            pass
+    return False, last_err or "Falha no FFmpeg."
+
+
 def _convert_h264_to_mp4(
     ffmpeg: str,
     raw_path: Path,
@@ -284,51 +336,175 @@ def _convert_h264_to_mp4(
     return False, msg or "Falha na conversão."
 
 
+def _silent_audio_inputs(ffmpeg: str, src: Path) -> list[str]:
+    return [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-f",
+        "lavfi",
+        "-i",
+        "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-shortest",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+    ]
+
+
+def _keep_source_audio_inputs(ffmpeg: str, src: Path) -> list[str]:
+    return [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0",
+    ]
+
+
+def _aac_faststart_tail(dst: Path) -> list[str]:
+    return [
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(dst),
+    ]
+
+
 def _remux_compatible_mp4(ffmpeg: str, src: Path, dst: Path) -> tuple[bool, str]:
     """Gera MP4 compatível (H.264 + AAC + faststart) para players do Windows."""
-    attempts: list[list[str]] = [
-        # 1) remux rápido preservando vídeo
+    keep_audio = _has_audio_stream(src)
+    if keep_audio:
+        attempts = [
+            _keep_source_audio_inputs(ffmpeg, src) + ["-c:v", "copy"] + _aac_faststart_tail(dst),
+            _keep_source_audio_inputs(ffmpeg, src)
+            + [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                "-profile:v",
+                "main",
+                "-level",
+                "4.0",
+            ]
+            + _aac_faststart_tail(dst),
+        ]
+    else:
+        attempts = [
+            _silent_audio_inputs(ffmpeg, src) + ["-c:v", "copy"] + _aac_faststart_tail(dst),
+            _silent_audio_inputs(ffmpeg, src)
+            + [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "20",
+                "-pix_fmt",
+                "yuv420p",
+                "-profile:v",
+                "main",
+                "-level",
+                "4.0",
+            ]
+            + _aac_faststart_tail(dst),
+        ]
+    ok, err = _try_ffmpeg_cmds(attempts, dst)
+    if ok:
+        return True, ""
+    return False, err or "Falha ao gerar MP4 compatível."
+
+
+def mux_audio_into_mp4(
+    ffmpeg: str, video: Path, audio: Path, dst: Path, audio_delay_s: float = 0.0
+) -> tuple[bool, str]:
+    """Substitui o áudio do MP4 (silêncio ou faixa original) pelo WAV/PCM gravado."""
+    if not video.exists() or video.stat().st_size < 1024:
+        return False, "Vídeo inválido para mesclar áudio."
+    if not audio.exists() or audio.stat().st_size < 1024:
+        return False, "Arquivo de áudio vazio ou ausente."
+
+    aac_tail = [
+        "-c:a",
+        "aac",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-b:a",
+        "160k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(dst),
+    ]
+    # O áudio costuma começar depois do vídeo (scrcpy demora a subir): atrasa a faixa.
+    delay = max(0.0, min(float(audio_delay_s or 0.0), 10.0))
+    audio_in = (["-itsoffset", f"{delay:.3f}"] if delay > 0.05 else []) + ["-i", str(audio)]
+    attempts = [
         [
             ffmpeg,
             "-y",
             "-loglevel",
             "error",
             "-i",
-            str(src),
-            "-f",
-            "lavfi",
+            str(video),
+            *audio_in,
+            "-filter_complex",
+            "[1:a]aresample=async=1:first_pts=0,apad[a]",
+            "-map",
+            "0:v:0",
+            "-map",
+            "[a]",
+            "-c:v",
+            "copy",
+        ]
+        + aac_tail,
+        [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
             "-i",
-            "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-shortest",
+            str(video),
+            *audio_in,
             "-map",
             "0:v:0",
             "-map",
             "1:a:0",
             "-c:v",
             "copy",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            str(dst),
-        ],
-        # 2) reencode compatível com Windows Media Player
+        ]
+        + aac_tail,
         [
             ffmpeg,
             "-y",
             "-loglevel",
             "error",
             "-i",
-            str(src),
-            "-f",
-            "lavfi",
-            "-i",
-            "anullsrc=channel_layout=stereo:sample_rate=44100",
-            "-shortest",
+            str(video),
+            *audio_in,
             "-map",
             "0:v:0",
             "-map",
@@ -341,38 +517,19 @@ def _remux_compatible_mp4(ffmpeg: str, src: Path, dst: Path) -> tuple[bool, str]
             "20",
             "-pix_fmt",
             "yuv420p",
-            "-profile:v",
-            "main",
-            "-level",
-            "4.0",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-movflags",
-            "+faststart",
-            "-f",
-            "mp4",
-            str(dst),
-        ],
+        ]
+        + aac_tail,
     ]
-    last_err = ""
-    for cmd in attempts:
+    ok, err = _try_ffmpeg_cmds(attempts, dst)
+    if ok and _has_audio_stream(dst):
+        return True, ""
+    if ok:
         try:
-            if dst.exists():
-                dst.unlink(missing_ok=True)
+            dst.unlink(missing_ok=True)
         except Exception:
             pass
-        cp = run_hidden(cmd, capture_output=True, text=True, timeout=300)
-        if cp.returncode == 0 and _mp4_is_playable(dst):
-            return True, ""
-        last_err = (cp.stderr or cp.stdout or "").strip()
-        try:
-            if dst.exists():
-                dst.unlink(missing_ok=True)
-        except Exception:
-            pass
-    return False, last_err or "Falha ao gerar MP4 compatível."
+        return False, "O MP4 mesclado ficou sem faixa de áudio."
+    return False, err or "Falha ao mesclar áudio no vídeo."
 
 
 class ScreenRecordThread(QThread):
@@ -403,8 +560,11 @@ class ScreenRecordThread(QThread):
         self._remote: str | None = None
 
     def stop(self) -> None:
-        """Interrompe o screenrecord com SIGINT e deixa o ADB finalizar o arquivo (moov)."""
+        """Pede a parada (não bloqueia a UI); a própria thread envia o SIGINT e finaliza o MP4."""
         self._stop = True
+
+    def _interrupt_remote(self) -> None:
+        """SIGINT no screenrecord para o ADB gravar o átomo moov."""
         for shell_cmd in (
             "kill -INT $(pidof screenrecord) 2>/dev/null",
             "pkill -INT screenrecord 2>/dev/null",
@@ -420,7 +580,6 @@ class ScreenRecordThread(QThread):
                 )
             except Exception:
                 pass
-        # Não mata o processo adb imediatamente: o screenrecord precisa gravar o átomo moov.
 
     def _wait_screenrecord_exit(self, grace_s: float = 20.0) -> None:
         if self._popen is None:
@@ -469,6 +628,7 @@ class ScreenRecordThread(QThread):
 
             while True:
                 if self._stop:
+                    self._interrupt_remote()
                     self._wait_screenrecord_exit(grace_s=20.0)
                     break
                 if self._popen.poll() is not None:
@@ -592,6 +752,11 @@ class ScreenRecordThread(QThread):
         except Exception as e:
             self.failed.emit(str(e))
         finally:
+            for suffix in (".pull.mp4", ".compat.mp4"):
+                try:
+                    self.out_path.with_name(self.out_path.stem + suffix).unlink(missing_ok=True)
+                except Exception:
+                    pass
             if remote:
                 try:
                     run_hidden(

@@ -11,7 +11,8 @@ import threading
 import zipfile
 from pathlib import Path
 
-from installer.windows_trust import smart_app_control_active, trust_installed_app
+from aibox.ziputil import validate_zip
+from installer.windows_trust import powershell_exe, smart_app_control_active, trust_installed_app
 
 INSTALL_DIR = Path(r"C:\Aibox")
 APP_EXE_NAME = "Aibox.exe"
@@ -42,6 +43,12 @@ def _resource_path(name: str) -> Path:
         if p.is_file():
             return p
     return here / name
+
+
+def _system32(exe: str) -> str:
+    windir = os.environ.get("SystemRoot") or r"C:\Windows"
+    p = Path(windir) / "System32" / exe
+    return str(p) if p.is_file() else exe
 
 
 def _hidden_run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -80,7 +87,7 @@ def _stop_running_app() -> None:
     for name in ("Aibox.exe", "adb.exe"):
         try:
             _hidden_run(
-                ["taskkill", "/F", "/IM", name, "/T"],
+                [_system32("taskkill.exe"), "/F", "/IM", name, "/T"],
                 capture_output=True,
                 timeout=10,
             )
@@ -105,7 +112,7 @@ $sc.Description = 'Aibox — Intelite'
 $sc.Save()
 """
     _hidden_run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+        [powershell_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
         check=False,
         capture_output=True,
         timeout=20,
@@ -175,12 +182,14 @@ def perform_install(progress=None) -> Path:
     report(0.02, "Encerrando instâncias anteriores…")
     _stop_running_app()
 
-    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    stage = INSTALL_DIR.with_name(INSTALL_DIR.name + ".installing")
+    backup = INSTALL_DIR.with_name(INSTALL_DIR.name + ".old")
 
     with tempfile.TemporaryDirectory(prefix="aibox_setup_") as tmp:
         tmp_path = Path(tmp)
         report(0.08, "Extraindo arquivos…")
         with zipfile.ZipFile(payload, "r") as zf:
+            validate_zip(zf)  # recusa ../, caminhos absolutos, ADS (:), nomes reservados e zip-bomb
             infos = zf.infolist()
             total = max(len(infos), 1)
             for i, info in enumerate(infos, start=1):
@@ -199,27 +208,51 @@ def perform_install(progress=None) -> Path:
                 raise RuntimeError("Aibox.exe não encontrado no pacote.")
 
         report(0.66, "Preparando pasta de destino…")
-        for item in list(INSTALL_DIR.iterdir()):
-            if item.name.lower() in ("capturas",):
-                continue
-            if item.is_dir():
-                shutil.rmtree(item, ignore_errors=True)
-            else:
-                try:
-                    item.unlink()
-                except OSError:
-                    pass
+        # Copia para uma pasta de staging: a instalação anterior só é trocada no final,
+        # então uma falha no meio da cópia não deixa o app destruído.
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True, exist_ok=True)
 
         files = [p for p in src.rglob("*") if p.is_file()]
         total_files = max(len(files), 1)
-        report(0.70, "Copiando para C:\\Aibox…")
-        for i, item in enumerate(files, start=1):
-            rel = item.relative_to(src)
-            dest = INSTALL_DIR / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, dest)
-            if i == 1 or i == total_files or i % 20 == 0:
-                report(0.70 + 0.20 * (i / total_files), f"Copiando arquivos… ({i}/{total_files})")
+        report(0.70, "Copiando arquivos…")
+        try:
+            for i, item in enumerate(files, start=1):
+                rel = item.relative_to(src)
+                dest = stage / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, dest)
+                if i == 1 or i == total_files or i % 20 == 0:
+                    report(0.70 + 0.20 * (i / total_files), f"Copiando arquivos… ({i}/{total_files})")
+            if not (stage / APP_EXE_NAME).is_file():
+                raise RuntimeError("Falha ao copiar Aibox.exe.")
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+
+        report(0.91, "Aplicando a nova versão…")
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+        had_old = INSTALL_DIR.exists()
+        if had_old:
+            # preserva as capturas do usuário
+            for child in INSTALL_DIR.iterdir():
+                if child.name.lower() == "capturas" and child.is_dir():
+                    try:
+                        shutil.move(str(child), str(stage / child.name))
+                    except OSError:
+                        pass
+            INSTALL_DIR.rename(backup)
+        try:
+            stage.rename(INSTALL_DIR)
+        except Exception:
+            if had_old and backup.exists() and not INSTALL_DIR.exists():
+                backup.rename(INSTALL_DIR)  # rollback
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
 
     exe = INSTALL_DIR / APP_EXE_NAME
     if not exe.is_file():

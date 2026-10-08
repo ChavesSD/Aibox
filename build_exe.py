@@ -46,9 +46,21 @@ def _ensure_platform_tools() -> Path:
     print(f"  {PLATFORM_TOOLS_URL}")
     with tempfile.TemporaryDirectory(prefix="aibox_pt_") as tmp:
         zpath = Path(tmp) / "platform-tools.zip"
-        urllib.request.urlretrieve(PLATFORM_TOOLS_URL, zpath)
+        # Com timeout e limite de tamanho (urlretrieve não tem nenhum dos dois).
+        with urllib.request.urlopen(PLATFORM_TOOLS_URL, timeout=60) as resp, zpath.open("wb") as out:
+            total = 0
+            while True:
+                block = resp.read(256 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total > 200 * 1024 * 1024:
+                    raise SystemExit("platform-tools maior que o esperado; download abortado.")
+                out.write(block)
+        from aibox.ziputil import safe_extract_zip
+
         with zipfile.ZipFile(zpath) as zf:
-            zf.extractall(tmp)
+            safe_extract_zip(zf, Path(tmp))
         src = Path(tmp) / "platform-tools"
         if not (src / "adb.exe").is_file():
             found = list(Path(tmp).rglob("adb.exe"))
@@ -112,13 +124,11 @@ def _ensure_ico() -> Path | None:
 
 
 def _app_version() -> str:
-    ns: dict = {}
+    import re
+
     theme = (ROOT / "aibox" / "theme.py").read_text(encoding="utf-8")
-    for line in theme.splitlines():
-        if line.startswith("APP_VERSION"):
-            exec(line, ns, ns)
-            break
-    return str(ns.get("APP_VERSION", "0.0.0"))
+    m = re.search(r'^APP_VERSION\s*=\s*"([0-9][0-9A-Za-z.\-+]*)"', theme, re.MULTILINE)
+    return m.group(1) if m else "0.0.0"
 
 
 def _sha256(path: Path) -> str:
@@ -265,7 +275,7 @@ def _kill_locking_processes() -> None:
             subprocess.run([str(p), "kill-server"], capture_output=True, timeout=8)
     # taskkill por nome (repetido — adb às vezes respawna)
     for _ in range(3):
-        for name in ("Aibox.exe", "adb.exe", "Aibox-Setup.exe"):
+        for name in ("Aibox.exe", "adb.exe", "Aibox-Setup.exe", "scrcpy.exe"):
             subprocess.run(
                 ["taskkill", "/F", "/IM", name, "/T"],
                 capture_output=True,
@@ -403,6 +413,11 @@ def _try_sign(path: Path) -> None:
         cmd += ["/f", pfx]
         password = os.environ.get("AIBOX_PFX_PASSWORD", "")
         if password:
+            print(
+                "AVISO: a senha do PFX vai na linha de comando (visível a outros processos). "
+                "Prefira AIBOX_CERT_THUMBPRINT com o certificado instalado no Windows.",
+                file=sys.stderr,
+            )
             cmd += ["/p", password]
     else:
         cmd += ["/sha1", thumb]
@@ -442,6 +457,9 @@ def main() -> int:
 
     try:
         _ensure_platform_tools()
+        from aibox.device_audio import ensure_scrcpy
+
+        print(f"scrcpy: {ensure_scrcpy()}")
         _ensure_ico()
         _prepare_build_dirs()
     except SystemExit as e:
