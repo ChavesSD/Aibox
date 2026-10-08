@@ -327,6 +327,9 @@ class MainWindow(QMainWindow):
         self._factory_reset_busy: bool = False
         self._closing: bool = False
         self._adb_initing: bool = False
+        self._video_pending: bool = False
+        self._pending_serial: str = ""
+        self._pending_want_audio: bool = False
         self._autostart_auto: bool = False  # Autostart marcado automaticamente (não pelo usuário)
         self._last_apk_avail_msg: str = ""
         self.recording_state: str = "idle"
@@ -912,7 +915,8 @@ class MainWindow(QMainWindow):
         self.chk_record_audio.setChecked(True)
         self.chk_record_audio.setToolTip(
             "Captura o áudio reproduzido no Mini PC (saída HDMI) e inclui no mesmo arquivo MP4. "
-            "Requer Android 11 ou superior."
+            "Android 11+: nativo (scrcpy). Android 10: usa um aplicativo auxiliar (sndcpy) instalado "
+            "automaticamente no aparelho."
         )
         self.lbl_record_audio = QLabel("Áudio do Mini PC")
         self.lbl_record_audio.setObjectName("ToggleRowLabel")
@@ -2782,8 +2786,6 @@ class MainWindow(QMainWindow):
             base = out_dir / f"record_{serial.replace(':', '_')}_{ts}"
             out = Path(str(base) + ".mp4")
             audio_out = Path(str(base) + ".wav") if want_audio else None
-            started_at = time.monotonic()
-            self._record_started_at = started_at
             self._audio_delay_s = 0.0
             record_thread = ScreenRecordThread(
                 adb_path=self.adb.adb_path,
@@ -2792,7 +2794,7 @@ class MainWindow(QMainWindow):
                 bit_rate=4000000,
                 size=None,
                 time_limit_s=180,
-                started_at=started_at,
+                started_at=time.monotonic(),
             )
             record_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
             record_thread.finished.connect(self._on_recording_finished)
@@ -2804,14 +2806,27 @@ class MainWindow(QMainWindow):
                 audio_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
                 audio_thread.finished.connect(self._on_audio_finished)
                 audio_thread.failed.connect(self._on_audio_failed)
+                audio_thread.ready.connect(self._begin_video_recording)
 
             self.record_thread = record_thread
             self.audio_thread = audio_thread
             self._audio_out_path = audio_out
+            self._video_pending = True
+            self._pending_serial = serial
+            self._pending_want_audio = want_audio
             if audio_thread is not None:
+                # O áudio demora a preparar (instala o app auxiliar/scrcpy): o vídeo só começa quando
+                # ele estiver entrando, para não perder o som do início. Prazo máximo de segurança.
+                self._append(
+                    self.txt_gravar_out,
+                    "Preparando a captura de áudio do aparelho… o vídeo começa em seguida.",
+                )
                 audio_thread.start()
-            record_thread.start()
+                QTimer.singleShot(35000, self._begin_video_recording)
+            else:
+                self._begin_video_recording()
         except Exception as e:
+            self._video_pending = False
             self.record_thread = None
             self.audio_thread = None
             self._audio_out_path = None
@@ -2819,12 +2834,28 @@ class MainWindow(QMainWindow):
             self._err_dialog(f"Não foi possível iniciar a gravação: {e}")
             return
 
+    @Slot()
+    def _begin_video_recording(self) -> None:
+        """Inicia o vídeo (uma única vez): chamado quando o áudio está pronto, falhou ou estourou o prazo."""
+        if not self._video_pending or self.record_thread is None:
+            return
+        self._video_pending = False
+        serial = self._pending_serial
+        now = time.monotonic()
+        self._record_started_at = now
+        self.record_thread.started_at = now
+        try:
+            self.record_thread.start()
+        except Exception as e:  # noqa: BLE001
+            self._stop_audio_recording()
+            self._on_recording_failed(f"Não foi possível iniciar a gravação: {e}")
+            return
         self._set_recording_state("recording")
         self._start_recording_ui(serial)
-        if want_audio:
+        if self._pending_want_audio and self.audio_thread is not None:
             self._append(
                 self.txt_gravar_out,
-                "Gravando tela + áudio do Mini PC… o som HDMI entra no mesmo arquivo MP4.",
+                "Gravando tela + áudio do Mini PC… o som entra no mesmo arquivo MP4.",
             )
         else:
             self._append(self.txt_gravar_out, "Gravando… clique em Parar gravação para encerrar.")
@@ -2850,6 +2881,10 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_audio_failed(self, msg: str) -> None:
         self._append(self.txt_gravar_out, f"Áudio: {msg}")
+        # O áudio desistiu antes de o vídeo começar: grava só o vídeo (e avisa).
+        if self._video_pending:
+            self._append(self.txt_gravar_out, "Gravando o vídeo sem o áudio do aparelho.")
+            self._begin_video_recording()
 
     def _finish_recording_ok(self, path: str, *, with_audio: bool) -> None:
         self._set_recording_state("idle")
@@ -2880,7 +2915,7 @@ class MainWindow(QMainWindow):
             delay = 0.0
             if audio_thr.audio_started_at is not None:
                 # ~0,6 s: tempo que o screenrecord leva até o primeiro quadro.
-                delay = max(0.0, audio_thr.audio_started_at - started - 0.6)
+                delay = audio_thr.audio_started_at - started - 0.6  # negativo: áudio começou antes
             ffmpeg = _resolve_ffmpeg()
             if not ffmpeg:
                 raise RuntimeError("FFmpeg não encontrado para incluir o áudio no MP4.")

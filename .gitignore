@@ -28,6 +28,7 @@ aibox/platform-tools/*.exe
 aibox/platform-tools/*.dll
 aibox/scrcpy/
 aibox/ffmpeg/
+aibox/sndcpy/
 
 # IDE / OS
 .idea/

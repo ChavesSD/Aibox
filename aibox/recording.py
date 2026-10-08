@@ -514,8 +514,14 @@ def mux_audio_into_mp4(
         str(dst),
     ]
     # O áudio costuma começar depois do vídeo (scrcpy demora a subir): atrasa a faixa.
-    delay = max(0.0, min(float(audio_delay_s or 0.0), 10.0))
-    audio_in = (["-itsoffset", f"{delay:.3f}"] if delay > 0.05 else []) + ["-i", str(audio)]
+    # >0: o áudio começou depois do vídeo (atrasa a faixa); <0: começou antes (corta o início).
+    delay = max(-30.0, min(float(audio_delay_s or 0.0), 10.0))
+    if delay > 0.05:
+        audio_in = ["-itsoffset", f"{delay:.3f}", "-i", str(audio)]
+    elif delay < -0.05:
+        audio_in = ["-ss", f"{-delay:.3f}", "-i", str(audio)]
+    else:
+        audio_in = ["-i", str(audio)]
     attempts = [
         [
             ffmpeg,

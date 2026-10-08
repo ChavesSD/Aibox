@@ -75,6 +75,17 @@ for _name in ("LICENSE.txt", "README.txt", "SOURCE.txt"):
     if _f.is_file():
         datas.append((str(_f), "aibox/ffmpeg"))
 
+sndcpy_src = PKG / "sndcpy"
+if not (sndcpy_src / "sndcpy.apk").is_file():
+    raise SystemExit(
+        "sndcpy ausente em aibox/sndcpy. Rode python build_exe.py "
+        "(baixa o aplicativo auxiliar de áudio usado no Android 10)."
+    )
+for _name in ("sndcpy.apk", "LICENSE.txt", "SOURCE.txt"):
+    _f = sndcpy_src / _name
+    if _f.is_file():
+        datas.append((str(_f), "aibox/sndcpy"))
+
 datas += collect_data_files("qtawesome")
 
 hiddenimports = [
@@ -87,6 +98,7 @@ hiddenimports = [
     "aibox.apk_sync",
     "aibox.device_audio",
     "aibox.ziputil",
+    "aibox.sndcpy_audio",
     "aibox.github_fetch",
 ]
 

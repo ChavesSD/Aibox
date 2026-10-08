@@ -5,7 +5,8 @@
   "published_at": "2026-10-07",
   "notes": {
     "added": [
-      "Gravação de tela agora inclui o áudio do equipamento (som HDMI do Mini PC) no mesmo MP4",
+      "Gravação de tela agora inclui o áudio do equipamento (som do Mini PC) no mesmo MP4, inclusive em Android 10",
+      "Android 10: o app instala automaticamente um aplicativo auxiliar (sndcpy, MIT) para capturar o som; o vídeo só começa quando o áudio está pronto",
       "ffmpeg embutido no app: a gravação funciona sem instalar nada no PC",
       "Botão Parear para a Depuração sem fio (Android 11+)",
       "Os APKs já baixados são mantidos ao atualizar o app",

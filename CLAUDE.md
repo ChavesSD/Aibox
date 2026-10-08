@@ -67,3 +67,10 @@ Só validações aditivas: o caminho que já funcionava nos Mini PCs continua de
 - Animações (`_tts_prepare_fast_ui`/`_tts_restore_animations`) e brilho/fb (`_tts_restore_display`) são restaurados; `monkey` com `Events injected: 0` cai no `am start`; `/sdcard/aibox_ui.xml` é removido.
 - Pendente (precisa de aparelho): cancelamento/prazo total, Enter duplo, código morto `_tts_*`/`_ui_navigate_*` sem chamador.
 - Testes: `test_lote_d.py`, `test_lote_e.py` (188 no total).
+
+## Áudio do equipamento no Android 10 — sndcpy (08/10/2026, validado em aparelho)
+- Causa do "áudio não capturado": o Mini PC de teste (192.168.2.91, Allwinner H616) é **Android 10**; scrcpy só captura áudio no 11+ e o aparelho não tem `tinycap` (shell sem root). O MP4 saía com a faixa de silêncio de compatibilidade (-91 dB).
+- Solução: `aibox/sndcpy_audio.py` (sem Qt, testável) usa o APK do **sndcpy 1.1** (MIT; SHA-256 fixados; baixado por `build_exe._ensure_sndcpy()` para `aibox/sndcpy/`, gitignored): `install -t -r -g` (pulado se a versão/permissão já estão ok) → `appops set com.rom1v.sndcpy PROJECT_MEDIA allow` (sem diálogo na tela) → `adb forward tcp:<livre> localabstract:sndcpy` → `am start …/.MainActivity` → lê PCM s16le 48 kHz estéreo → WAV. Ordem em `DeviceAudioRecordThread`: scrcpy (SDK>=30) → sndcpy (SDK>=29) → tinycap.
+- O **vídeo só começa quando o áudio está entrando** (`ready` → `MainWindow._begin_video_recording`; prazo 35 s; falha do áudio = grava só o vídeo e avisa). A preparação leva ~7 s na 1ª vez (instala o app) e ~2 s depois. `mux_audio_into_mp4` aceita atraso negativo (corta o início do áudio).
+- Teste ponta a ponta feito pelo próprio `MainWindow` contra o aparelho real: MP4 com áudio real (-19,7 dB médio, som já no 1º segundo). Sincronia fina áudio/vídeo (±0,5 s, `-0.6` s de latência do screenrecord) ainda sem conferência visual.
+- Testes: `test_sndcpy_audio.py` (servidor TCP falso + adb falso).

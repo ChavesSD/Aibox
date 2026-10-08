@@ -92,6 +92,54 @@ def _ensure_ffmpeg() -> Path:
     return dest
 
 
+def _ensure_sndcpy() -> Path:
+    """Garante aibox/sndcpy/sndcpy.apk (+ licença MIT): áudio do Android 10, onde o scrcpy não captura."""
+    from aibox.sndcpy_audio import (
+        SNDCPY_APK_SHA256,
+        SNDCPY_LICENSE_SHA256,
+        SNDCPY_LICENSE_URL,
+        SNDCPY_ZIP_SHA256,
+        SNDCPY_ZIP_URL,
+    )
+
+    dest = ROOT / "aibox" / "sndcpy"
+    apk = dest / "sndcpy.apk"
+    lic = dest / "LICENSE.txt"
+    if apk.is_file() and lic.is_file() and _sha256(apk) == SNDCPY_APK_SHA256:
+        print(f"sndcpy empacotado: {apk}")
+        return dest
+
+    import io
+    import urllib.request
+
+    def fetch(url: str, limit: int) -> bytes:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read(limit + 1)
+        if len(data) > limit:
+            raise SystemExit(f"Download maior que o esperado: {url}")
+        return data
+
+    print(f"Baixando sndcpy {SNDCPY_ZIP_URL.rsplit('/', 1)[-1]}…")
+    dest.mkdir(parents=True, exist_ok=True)
+    zdata = fetch(SNDCPY_ZIP_URL, 5 * 1024 * 1024)
+    if hashlib.sha256(zdata).hexdigest() != SNDCPY_ZIP_SHA256:
+        raise SystemExit("SHA-256 do zip do sndcpy não confere.")
+    with zipfile.ZipFile(io.BytesIO(zdata)) as zf:
+        apk_bytes = zf.read("sndcpy.apk")
+    if hashlib.sha256(apk_bytes).hexdigest() != SNDCPY_APK_SHA256:
+        raise SystemExit("SHA-256 do sndcpy.apk não confere.")
+    lic_bytes = fetch(SNDCPY_LICENSE_URL, 1024 * 64)
+    if hashlib.sha256(lic_bytes).hexdigest() != SNDCPY_LICENSE_SHA256:
+        raise SystemExit("SHA-256 da licença do sndcpy não confere.")
+    apk.write_bytes(apk_bytes)
+    lic.write_bytes(lic_bytes)
+    (dest / "SOURCE.txt").write_text(
+        f"sndcpy {SNDCPY_ZIP_URL}\nhttps://github.com/rom1v/sndcpy (MIT)\n", encoding="utf-8"
+    )
+    print(f"sndcpy pronto: {apk}")
+    return dest
+
+
 def _ensure_platform_tools() -> Path:
     """Garante adb.exe + DLLs USB em aibox/platform-tools (necessário no .exe)."""
     dest = ROOT / "aibox" / "platform-tools"
@@ -557,6 +605,7 @@ def main() -> int:
 
         print(f"scrcpy: {ensure_scrcpy()}")
         _ensure_ffmpeg()
+        _ensure_sndcpy()
         _ensure_ico()
         _prepare_build_dirs()
     except SystemExit as e:

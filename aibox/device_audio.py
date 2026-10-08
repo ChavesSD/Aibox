@@ -21,6 +21,7 @@ from PySide6.QtCore import QThread, Signal
 from .github_fetch import safe_urlopen
 from .paths import executable_dir, is_frozen, package_dir, resource_path
 from .procutil import popen_hidden, run_hidden
+from .sndcpy_audio import SndcpyCapture, pcm_peak_dbfs, pcm_to_wav
 from .ziputil import safe_extract_zip
 
 SCRCPY_VERSION = "5.0"
@@ -74,7 +75,7 @@ def scrcpy_audio_args_for_sdk(sdk: int) -> tuple[list[str], str]:
             ["--audio-source", "output"],
             "Neste Android o som da TV pode ficar mudo enquanto a gravação estiver ativa.",
         )
-    return [], "Áudio interno via ADB exige Android 11+."
+    return [], "O scrcpy só captura áudio interno no Android 11+."
 
 
 def parse_alsa_captures(pcm_text: str) -> list[AlsaCapture]:
@@ -298,9 +299,12 @@ class DeviceAudioRecordThread(QThread):
     status = Signal(str)
     finished = Signal(str)
     failed = Signal(str)
+    # Emitido quando o áudio já está entrando (ou quando desistiu): libera o início do vídeo.
+    ready = Signal()
 
     def __init__(self, adb_path: str, serial: str, out_path: Path) -> None:
         super().__init__()
+        self._ready_sent = False
         self.adb_path = str(adb_path)
         self.serial = str(serial)
         self.out_path = Path(out_path)
@@ -313,6 +317,11 @@ class DeviceAudioRecordThread(QThread):
     def stop(self) -> None:
         """Pede a parada (não bloqueia a UI); a própria thread encerra o scrcpy."""
         self._stop = True
+
+    def _emit_ready(self) -> None:
+        if not self._ready_sent:
+            self._ready_sent = True
+            self.ready.emit()
 
     def _signal_stop_process(self) -> None:
         p = self._popen
@@ -350,6 +359,12 @@ class DeviceAudioRecordThread(QThread):
 
     def run(self) -> None:
         try:
+            self._run_impl()
+        finally:
+            self._emit_ready()  # sucesso ou falha: nunca deixa o vídeo esperando
+
+    def _run_impl(self) -> None:
+        try:
             self.out_path.parent.mkdir(parents=True, exist_ok=True)
             if self.out_path.exists():
                 self.out_path.unlink(missing_ok=True)
@@ -358,6 +373,8 @@ class DeviceAudioRecordThread(QThread):
             return
 
         sdk = _device_sdk(self.adb_path, self.serial)
+        if sdk is not None:
+            self.status.emit(f"Áudio: aparelho com Android SDK {sdk}.")
         if sdk is not None and sdk >= 30:
             if self._capture_with_scrcpy(sdk):
                 return
@@ -365,14 +382,66 @@ class DeviceAudioRecordThread(QThread):
                 self.failed.emit("Captura de áudio do Mini PC interrompida.")
                 return
 
+        # Android 10+ (inclui o 10, onde o scrcpy não captura): aplicativo auxiliar sndcpy.
+        sndcpy_err = ""
+        if sdk is not None and sdk >= 29:
+            handled, sndcpy_err = self._capture_with_sndcpy()
+            if handled:
+                return
+            if self._stop:
+                self.failed.emit("Captura de áudio do Mini PC interrompida.")
+                return
+            self.status.emit(f"Áudio: aplicativo auxiliar indisponível — {sndcpy_err}.")
+
         tinycap_err = self._capture_with_tinycap()
         if tinycap_err is None:
             return
+        extra = f"\nAplicativo auxiliar: {sndcpy_err}." if sndcpy_err else ""
         self.failed.emit(
-            tinycap_err
+            tinycap_err + extra
             if sdk is None or sdk < 30
-            else f"{tinycap_err}\nÁudio interno do Mini PC não pôde ser capturado."
+            else f"{tinycap_err}\nÁudio interno do Mini PC não pôde ser capturado.{extra}"
         )
+
+    def _capture_with_sndcpy(self) -> tuple[bool, str]:
+        """(tratado, motivo). tratado=True: já emitiu finished; False: tentar o próximo método."""
+        pcm = self.out_path.with_suffix(".pcm")
+
+        def on_first() -> None:
+            self.audio_started_at = time.monotonic()
+            self._emit_ready()
+
+        cap = SndcpyCapture(
+            self.adb_path,
+            self.serial,
+            pcm,
+            should_stop=lambda: self._stop,
+            status=self.status.emit,
+            on_first_data=on_first,
+        )
+        result = cap.run()
+        try:
+            if not result.ok or result.bytes_written <= 0:
+                return False, result.reason or "sem dados de áudio"
+            written = pcm_to_wav(pcm, self.out_path)
+            if written < 1024:
+                return False, "áudio capturado vazio"
+            peak = pcm_peak_dbfs(pcm)
+            seconds = written / (48000 * 2 * 2)
+            if peak is None or peak == float("-inf") or peak < -70.0:
+                self.status.emit(
+                    f"Áudio: {seconds:.0f}s capturados, mas sem som (silêncio). Nada foi reproduzido "
+                    "no aparelho ou o aplicativo que toca bloqueia a captura."
+                )
+            else:
+                self.status.emit(f"Áudio: {seconds:.0f}s capturados (pico {peak:.1f} dBFS).")
+            self.finished.emit(str(self.out_path))
+            return True, ""
+        finally:
+            try:
+                pcm.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _capture_with_scrcpy(self, sdk: int) -> bool:
         """True = já sinalizou sucesso/falha; False = tentar tinycap."""
@@ -441,6 +510,7 @@ class DeviceAudioRecordThread(QThread):
                 stderr_lines.append(line.rstrip())
                 if self.audio_started_at is None and "recording started" in line.lower():
                     self.audio_started_at = time.monotonic()
+                    self._emit_ready()
 
         drain = threading.Thread(target=_drain, daemon=True)
         drain.start()
@@ -450,6 +520,8 @@ class DeviceAudioRecordThread(QThread):
                 break
             if self._popen.poll() is not None:
                 break
+            if not self._ready_sent and time.monotonic() - started > 4.0:
+                self._emit_ready()  # a mensagem de início pode não aparecer: não trava o vídeo
             time.sleep(0.08)
         elapsed = time.monotonic() - started
 
@@ -518,6 +590,7 @@ class DeviceAudioRecordThread(QThread):
         except Exception as e:
             return f"Falha ao iniciar tinycap: {e}"
 
+        self._emit_ready()
         while True:
             if self._stop:
                 self._interrupt_device_tools()
