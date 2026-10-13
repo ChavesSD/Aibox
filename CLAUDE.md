@@ -74,3 +74,8 @@ Só validações aditivas: o caminho que já funcionava nos Mini PCs continua de
 - O **vídeo só começa quando o áudio está entrando** (`ready` → `MainWindow._begin_video_recording`; prazo 35 s; falha do áudio = grava só o vídeo e avisa). A preparação leva ~7 s na 1ª vez (instala o app) e ~2 s depois. `mux_audio_into_mp4` aceita atraso negativo (corta o início do áudio).
 - Teste ponta a ponta feito pelo próprio `MainWindow` contra o aparelho real: MP4 com áudio real (-19,7 dB médio, som já no 1º segundo). Sincronia fina áudio/vídeo (±0,5 s, `-0.6` s de latência do screenrecord) ainda sem conferência visual.
 - Testes: `test_sndcpy_audio.py` (servidor TCP falso + adb falso).
+
+## Síntese de Voz — verificação do idioma (13/10/2026)
+- Defeito achado no aparelho real: a receita "38× baixo" pode parar em **polonês (Polônia)** (a 1ª seta às vezes só foca o 1º item da lista) e o app dava "Voz V confirmada". Agora `_tts_ensure_portuguese_brazil` lê o TÍTULO da tela "<idioma> (<país>) vozes" (`xml_voice_language_title`); se não for português (Brasil): BACK (o foco permanece no item), 1 seta para o lado certo (comparação alfabética), Enter e reconfere (até 4 correções). Se não conseguir, **retorna falha** (`idioma-errado=<idioma>`) em vez de marcar a Voz V de outro idioma; a tela final também é conferida.
+- Texto do Otimizar: o aumento de disco é atribuído ao dexopt quando ele rodou.
+- Testes: `test_tts_idioma.py` (227 no total). **Validação ao vivo INCONCLUSIVA**: nas execuções ao vivo seguintes o app viu `apos-enter=unknown` (dump parecia ser do launcher) e o aparelho caiu da rede logo depois; repetir quando voltar.

@@ -2124,6 +2124,63 @@ class Adb:
         self.shell_try(serial, "input keyevent 44 43 46", timeout_s=3)
         time.sleep(0.28)
 
+    @staticmethod
+    def xml_voice_language_title(xml: str) -> str | None:
+        """Idioma da tela «<idioma> (<país>) vozes» do instalador de vozes (None se não for essa tela)."""
+        import xml.etree.ElementTree as ET
+
+        raw = (xml or "").strip()
+        if "<" not in raw:
+            return None
+        try:
+            root = ET.fromstring(raw[raw.index("<") :])
+        except ET.ParseError:
+            return None
+        for node in root.iter("node"):
+            m = re.fullmatch(r"\s*(.+?)\s+(vozes|voices)\s*", node.get("text") or "", re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    @staticmethod
+    def _locale_title_is_pt_br(title: str | None) -> bool:
+        low = Adb._fold_ui_text(title or "")
+        return "portugu" in low and ("brasil" in low or "brazil" in low)
+
+    def _tts_ensure_portuguese_brazil(
+        self,
+        serial: str,
+        xml: str,
+        status: Callable[[str], None],
+        trail: list[str],
+    ) -> tuple[str, bool]:
+        """Confere pelo TÍTULO da tela que o idioma aberto é português (Brasil).
+
+        A receita de «38× baixo» depende de o foco já estar na lista (a 1ª seta pode só focar o 1º
+        item e a lista para um item antes, ex.: polonês). Se o título não for o certo, volta
+        (o foco permanece no item), anda um item na direção certa e reconfere.
+        """
+        for attempt in range(5):
+            title = self.xml_voice_language_title(xml)
+            if title is None or self._locale_title_is_pt_br(title):
+                if attempt:
+                    trail.append(f"idioma-corrigido={attempt}")
+                return xml, True
+            if attempt == 4:
+                break
+            status(f"TTS: abriu «{title}», não português (Brasil) — ajustando…")
+            key = 20 if self._fold_ui_text(title)[:7] < "portugu" else 19
+            self.shell_try(serial, "input keyevent 4", timeout_s=3)  # volta à lista de idiomas
+            time.sleep(1.0)
+            self.shell_try(serial, f"input keyevent {key}", timeout_s=3)
+            time.sleep(0.35)
+            self._tts_press_enter(serial)
+            time.sleep(1.4)
+            xml = self._dump_ui_xml(serial) or xml
+        trail.append(f"idioma-errado={self.xml_voice_language_title(xml)}")
+        status("TTS: não consegui abrir português (Brasil); a Voz V NÃO foi selecionada.")
+        return xml, False
+
     def _tts_press_enter(self, serial: str) -> None:
         """Enter depois que o destaque parou no item (CENTER sozinho no burst não abre)."""
         time.sleep(0.18)
@@ -2171,6 +2228,10 @@ class Adb:
             xml = self._dump_ui_xml(serial) or xml
             screen = self._tts_classify_screen(xml)
         trail.append(f"apos-enter={screen}")
+        xml, lang_ok = self._tts_ensure_portuguese_brazil(serial, xml, status, trail)
+        if not lang_ok:
+            return False, trail
+        screen = self._tts_classify_screen(xml)
         if screen == "country":
             status("TTS: tela de país — Brasil.")
             ok_br, extra = self._tts_open_country_brazil(
@@ -2208,6 +2269,11 @@ class Adb:
                 status("TTS: voz ainda baixando, aguardando…")
             time.sleep(2.5)
 
+        lang = self.xml_voice_language_title(xml)
+        if lang is not None and not self._locale_title_is_pt_br(lang):
+            trail.append(f"idioma-errado={lang}")
+            status(f"TTS: a tela de vozes é de «{lang}», não de português (Brasil).")
+            return False, trail
         if xml and (
             self.xml_voice_v_selected(xml) or self._tts_find_voice_v_center(xml)
         ):
@@ -2230,6 +2296,10 @@ class Adb:
                 break
             time.sleep(1.0)
             xml = self._dump_ui_xml(serial) or ""
+        lang = self.xml_voice_language_title(xml)
+        if lang is not None and not self._locale_title_is_pt_br(lang):
+            status(f"TTS: a tela final é de «{lang}», não de português (Brasil).")
+            return False, trail + [f"idioma-errado={lang}"]
         if self.xml_voice_v_selected(xml):
             status("TTS: Voz V marcada.")
             return True, trail + ["voz-v-ok"]
@@ -3706,7 +3776,12 @@ class Adb:
             if disk_delta > 64:
                 lines.append(f"• Disco (/data): liberou ≈ {self._fmt_kb(disk_delta)}")
             elif disk_delta < -64:
-                lines.append(f"• Disco (/data): aumentou ≈ {self._fmt_kb(-disk_delta)} (uso normal do sistema)")
+                reason = (
+                    "a compilação (dexopt) grava os apps otimizados no disco"
+                    if results.get("dexopt") == "ok"
+                    else "uso normal do sistema"
+                )
+                lines.append(f"• Disco (/data): aumentou ≈ {self._fmt_kb(-disk_delta)} ({reason})")
             else:
                 lines.append(
                     f"• Disco (/data): sem mudança relevante "
