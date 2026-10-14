@@ -50,7 +50,9 @@ from .apks_catalog import (
 from .apk_sync import ApkSyncResult, sync_apks
 from .device_audio import DeviceAudioRecordThread
 from .logcat import LogcatThread
-from .recording import ScreenRecordThread, _resolve_ffmpeg, mux_audio_into_mp4
+from .reboot_validate import wait_and_validate
+from .mic_record import MicRecordThread, list_microphones
+from .recording import ScreenRecordThread, _resolve_ffmpeg, mux_audios_into_mp4
 from .nav_icon_anim import NavIconAnimator
 from .page_header import PageHeader
 from .paths import is_frozen, resource_path
@@ -300,6 +302,7 @@ def expand_install_dependencies(
 
 class MainWindow(QMainWindow):
     _install_phase_progress = Signal(int, str)
+    _reboot_status = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -307,6 +310,7 @@ class MainWindow(QMainWindow):
         self.resize(920, 820)
         self.setMinimumSize(900, 800)
         self._install_phase_progress.connect(self._on_install_phase_progress)
+        self._reboot_status.connect(lambda m: self._append(self.txt_apps_out, m))
 
         self.bg = Background()
         self.adb: Adb | None = None
@@ -316,6 +320,11 @@ class MainWindow(QMainWindow):
         self.record_thread: ScreenRecordThread | None = None
         self.audio_thread: DeviceAudioRecordThread | None = None
         self._audio_out_path: Path | None = None
+        self.mic_thread: MicRecordThread | None = None
+        self._mic_out_path: Path | None = None
+        self._audio_expected: int = 0  # fontes de áudio que precisam estar prontas antes do vídeo
+        self._audio_ready: int = 0
+        self._mics: list = []
         self._audio_delay_s: float = 0.0
         self._record_started_at: float = 0.0
         self._retired_threads: list = []
@@ -362,6 +371,9 @@ class MainWindow(QMainWindow):
         self.apks_dir = ensure_apks_tree()
         self._install_queue: list[ApkEntry] = []
         self._install_busy: bool = False
+        self._reboot_busy: bool = False
+        self._install_reboot_serial: str | None = None
+        self._install_reboot_pkgs: list[str] = []
         self._install_total: int = 0
         self._install_done: int = 0
         self._install_progress_anim: QPropertyAnimation | None = None
@@ -391,6 +403,7 @@ class MainWindow(QMainWindow):
         # Depois da janela aparecer: ADB (sem bloquear nem abrir console).
         QTimer.singleShot(0, self._init_adb)
         QTimer.singleShot(400, self._auto_sync_apks)
+        QTimer.singleShot(900, self.refresh_microphones)
         # Depois de rodar com sucesso por um tempo, o backup da versão anterior pode sair.
         QTimer.singleShot(45000, self._cleanup_after_update)
 
@@ -927,6 +940,30 @@ class MainWindow(QMainWindow):
         audio_row.addStretch(1)
         card_lay.addLayout(audio_row)
 
+        mic_row = QHBoxLayout()
+        mic_row.setSpacing(10)
+        self.chk_record_mic = ToggleSwitch()
+        self.chk_record_mic.setChecked(False)
+        self.chk_record_mic.setToolTip(
+            "Grava também o microfone do COMPUTADOR junto com o vídeo (narração, por exemplo). "
+            "Se o áudio do Mini PC também estiver ligado, os dois são misturados na mesma faixa do MP4."
+        )
+        self.lbl_record_mic = QLabel("Microfone do computador")
+        self.lbl_record_mic.setObjectName("ToggleRowLabel")
+        self.cmb_mic = QComboBox()
+        self.cmb_mic.setMinimumContentsLength(28)
+        self.cmb_mic.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_mic.setEnabled(False)
+        self.btn_refresh_mics = QPushButton("Atualizar")
+        self.btn_refresh_mics.setObjectName("SecondaryButton")
+        self.btn_refresh_mics.clicked.connect(self.refresh_microphones)
+        mic_row.addWidget(self.chk_record_mic, 0, Qt.AlignVCenter)
+        mic_row.addWidget(self.lbl_record_mic, 0, Qt.AlignVCenter)
+        mic_row.addWidget(self._outlined("Microfone", self.cmb_mic), 1)
+        mic_row.addWidget(self.btn_refresh_mics, 0, Qt.AlignVCenter)
+        card_lay.addLayout(mic_row)
+        self.chk_record_mic.toggled.connect(self._on_mic_toggled)
+
         self.txt_gravar_out = self._status_box("Status da gravação…", compact=True)
         card_lay.addWidget(self.txt_gravar_out)
 
@@ -1093,6 +1130,13 @@ class MainWindow(QMainWindow):
 
         self.txt_apps_out = self._status_box("Resultado das instalações…", compact=True)
         card_lay.addWidget(self.txt_apps_out)
+
+        self.chk_reboot_after = ToggleRow("Reiniciar o equipamento ao final (valida o Autostart)")
+        self.chk_reboot_after.setChecked(True)
+        self.chk_reboot_after.setToolTip(
+            "Depois de instalar e configurar o Autostart, reinicia o aparelho e confere se o app abre sozinho."
+        )
+        card_lay.addWidget(self.chk_reboot_after)
 
         self.btn_open_apks = QPushButton("Abrir pasta Apks")
         self.btn_open_apks.setObjectName("SecondaryButton")
@@ -2426,7 +2470,7 @@ class MainWindow(QMainWindow):
     def _wifi_monitor_tick(self) -> None:
         if self.wifi_state != "connected" or not self.adb or not self.wifi_connected_address:
             return
-        if self.wifi_reconnect_inflight:
+        if self.wifi_reconnect_inflight or self._reboot_busy:
             return
         address = self.wifi_connected_address
         self.wifi_reconnect_inflight = True
@@ -2740,6 +2784,9 @@ class MainWindow(QMainWindow):
         busy = state in ("starting", "recording", "stopping")
         if hasattr(self, "chk_record_audio"):
             self.chk_record_audio.setEnabled(not busy)
+            self.chk_record_mic.setEnabled(not busy)
+            self.cmb_mic.setEnabled(not busy and self.chk_record_mic.isChecked() and bool(self._mics))
+            self.btn_refresh_mics.setEnabled(not busy)
         if state == "idle":
             btn.setEnabled(True)
             btn.setText("Iniciar gravação")
@@ -2775,10 +2822,54 @@ class MainWindow(QMainWindow):
         btn.setIcon(_nav_icon("fa5s.play", QStyle.SP_MediaPlay, QSize(18, 18), COLOR_ICON_ON_PRIMARY, self.style()))
         _repolish(btn)
 
+    @Slot()
+    def refresh_microphones(self) -> None:
+        """Lista os microfones do Windows (DirectShow) em segundo plano."""
+
+        def ok(mics: list) -> None:
+            self._mics = list(mics)
+            current = self.cmb_mic.currentData()
+            self.cmb_mic.blockSignals(True)
+            self.cmb_mic.clear()
+            for m in self._mics:
+                self.cmb_mic.addItem(m.label, m.dshow_name)
+            if not self._mics:
+                self.cmb_mic.addItem("Nenhum microfone detectado")
+            else:
+                idx = self.cmb_mic.findData(current) if current else -1
+                self.cmb_mic.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cmb_mic.blockSignals(False)
+            self.cmb_mic.setEnabled(
+                bool(self._mics) and self.chk_record_mic.isChecked() and self.recording_state == "idle"
+            )
+
+        self.bg.run(list_microphones, ok, lambda _m: ok([]))
+
+    def _selected_mic(self) -> tuple[str, str] | None:
+        """(rótulo, nome DirectShow) do microfone escolhido, ou None."""
+        if not self._mics or self.cmb_mic.currentIndex() < 0:
+            return None
+        data = self.cmb_mic.currentData()
+        if not data:
+            return None
+        return self.cmb_mic.currentText().strip(), str(data)
+
+    def _on_mic_toggled(self, checked: bool) -> None:
+        self.cmb_mic.setEnabled(bool(checked) and bool(self._mics) and self.recording_state == "idle")
+        if checked and not self._mics:
+            self.refresh_microphones()
+
+    @Slot()
+    def _on_audio_source_ready(self) -> None:
+        """O vídeo começa quando TODAS as fontes de áudio ligadas estiverem capturando."""
+        self._audio_ready += 1
+        if self._audio_ready >= self._audio_expected:
+            self._begin_video_recording()
+
     def _stop_audio_recording(self) -> None:
-        thr = self.audio_thread
-        if thr is not None:
-            thr.stop()
+        for thr in (self.audio_thread, self.mic_thread):
+            if thr is not None:
+                thr.stop()
 
     @Slot()
     def start_recording(self) -> None:
@@ -2791,13 +2882,25 @@ class MainWindow(QMainWindow):
         if out_dir is None:
             return
 
-        want_audio = bool(self.chk_record_audio.isChecked())
+        want_device_audio = bool(self.chk_record_audio.isChecked())
+        want_mic = bool(self.chk_record_mic.isChecked())
+        mic = self._selected_mic() if want_mic else None
+        if want_mic and mic is None:
+            QMessageBox.warning(
+                self,
+                APP_NAME,
+                "O microfone do computador está ligado, mas nenhum microfone foi encontrado.\n\n"
+                "Conecte/ative um microfone e clique em «Atualizar», ou desligue essa opção.",
+            )
+            return
+        want_audio = want_device_audio or want_mic
         self._set_recording_state("starting")
         try:
             ts = time.strftime("%Y%m%d_%H%M%S")
             base = out_dir / f"record_{serial.replace(':', '_')}_{ts}"
             out = Path(str(base) + ".mp4")
-            audio_out = Path(str(base) + ".wav") if want_audio else None
+            audio_out = Path(str(base) + ".wav") if want_device_audio else None
+            mic_out = Path(str(base) + ".mic.wav") if mic is not None else None
             self._audio_delay_s = 0.0
             record_thread = ScreenRecordThread(
                 adb_path=self.adb.adb_path,
@@ -2818,30 +2921,50 @@ class MainWindow(QMainWindow):
                 audio_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
                 audio_thread.finished.connect(self._on_audio_finished)
                 audio_thread.failed.connect(self._on_audio_failed)
-                audio_thread.ready.connect(self._begin_video_recording)
+                audio_thread.ready.connect(self._on_audio_source_ready)
+
+            mic_thread = None
+            if mic is not None and mic_out is not None:
+                mic_thread = MicRecordThread(mic[1], mic_out, display_name=mic[0])
+                mic_thread.status.connect(lambda msg: self._append(self.txt_gravar_out, msg))
+                mic_thread.finished.connect(self._on_mic_finished)
+                mic_thread.failed.connect(self._on_mic_failed)
+                mic_thread.ready.connect(self._on_audio_source_ready)
 
             self.record_thread = record_thread
             self.audio_thread = audio_thread
+            self.mic_thread = mic_thread
             self._audio_out_path = audio_out
+            self._mic_out_path = mic_out
+            self._audio_expected = int(audio_thread is not None) + int(mic_thread is not None)
+            self._audio_ready = 0
             self._video_pending = True
             self._pending_serial = serial
             self._pending_want_audio = want_audio
-            if audio_thread is not None:
+            if audio_thread is not None or mic_thread is not None:
                 # O áudio demora a preparar (instala o app auxiliar/scrcpy): o vídeo só começa quando
-                # ele estiver entrando, para não perder o som do início. Prazo máximo de segurança.
+                # todas as fontes estiverem entrando, para não perder o som do início. Prazo de segurança.
                 self._append(
                     self.txt_gravar_out,
-                    "Preparando a captura de áudio do aparelho… o vídeo começa em seguida.",
+                    "Preparando a captura de áudio… o vídeo começa em seguida.",
                 )
-                audio_thread.start()
+                if audio_thread is not None:
+                    audio_thread.start()
+                if mic_thread is not None:
+                    mic_thread.start()
                 QTimer.singleShot(35000, self._begin_video_recording)
             else:
                 self._begin_video_recording()
         except Exception as e:
             self._video_pending = False
             self.record_thread = None
+            for thr in (self.audio_thread, self.mic_thread):
+                if thr is not None:
+                    thr.stop()
             self.audio_thread = None
+            self.mic_thread = None
             self._audio_out_path = None
+            self._mic_out_path = None
             self._set_recording_state("idle")
             self._err_dialog(f"Não foi possível iniciar a gravação: {e}")
             return
@@ -2864,10 +2987,15 @@ class MainWindow(QMainWindow):
             return
         self._set_recording_state("recording")
         self._start_recording_ui(serial)
-        if self._pending_want_audio and self.audio_thread is not None:
+        sources = []
+        if self.audio_thread is not None:
+            sources.append("áudio do Mini PC")
+        if self.mic_thread is not None:
+            sources.append("microfone do computador")
+        if sources:
             self._append(
                 self.txt_gravar_out,
-                "Gravando tela + áudio do Mini PC… o som entra no mesmo arquivo MP4.",
+                f"Gravando tela + {' + '.join(sources)}… o som entra no mesmo arquivo MP4.",
             )
         else:
             self._append(self.txt_gravar_out, "Gravando… clique em Parar gravação para encerrar.")
@@ -2893,10 +3021,25 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_audio_failed(self, msg: str) -> None:
         self._append(self.txt_gravar_out, f"Áudio: {msg}")
-        # O áudio desistiu antes de o vídeo começar: grava só o vídeo (e avisa).
+        # O áudio desistiu antes de o vídeo começar: segue sem ele (e avisa).
         if self._video_pending:
             self._append(self.txt_gravar_out, "Gravando o vídeo sem o áudio do aparelho.")
-            self._begin_video_recording()
+            self._on_audio_source_ready()
+
+    @Slot()
+    def _on_mic_finished(self, path: str) -> None:
+        try:
+            size = Path(path).stat().st_size
+            self._append(self.txt_gravar_out, f"Microfone capturado ({_fmt_bytes(size)}). Será mesclado no MP4.")
+        except Exception:
+            self._append(self.txt_gravar_out, "Microfone capturado. Será mesclado no MP4.")
+
+    @Slot()
+    def _on_mic_failed(self, msg: str) -> None:
+        self._append(self.txt_gravar_out, f"Microfone: {msg}")
+        if self._video_pending:
+            self._append(self.txt_gravar_out, "Gravando sem o microfone.")
+            self._on_audio_source_ready()
 
     def _finish_recording_ok(self, path: str, *, with_audio: bool) -> None:
         self._set_recording_state("idle")
@@ -2908,32 +3051,42 @@ class MainWindow(QMainWindow):
         except Exception:
             self._append(self.txt_gravar_out, f"Vídeo salvo: {path}")
 
-    def _mux_recorded_audio(self, video_path: str, audio_path: Path, audio_thr) -> None:
+    def _mux_recorded_audio(self, video_path: str, sources: list) -> None:
+        """sources: [(thread, arquivo_wav, rótulo)] — junta todas as faixas num só MP4."""
         video = Path(video_path)
         started = self._record_started_at
         self._append(self.txt_gravar_out, "Finalizando áudio e mesclando no vídeo…")
 
-        def fn() -> tuple[str, str]:
-            # Espera fora da thread da UI o scrcpy fechar o WAV.
-            audio_thr.wait(25000)
-            if audio_thr.isRunning():
-                return "noaudio", "O áudio do Mini PC demorou para finalizar; o MP4 foi salvo sem o som do equipamento."
-            try:
-                has_audio = audio_path.exists() and audio_path.stat().st_size > 1024
-            except OSError:
-                has_audio = False
-            if not has_audio:
-                return "noaudio", "Áudio do Mini PC não ficou pronto; o MP4 foi salvo sem som do equipamento."
-            delay = 0.0
-            if audio_thr.audio_started_at is not None:
-                # ~0,6 s: tempo que o screenrecord leva até o primeiro quadro.
-                delay = audio_thr.audio_started_at - started - 0.6  # negativo: áudio começou antes
+        def fn() -> tuple[str, str, list[str]]:
+            notes: list[str] = []
+            tracks: list[tuple[Path, float]] = []
+            paths: list[Path] = [p for _t, p, _l in sources]
+            # Espera fora da thread da UI cada captura fechar o WAV.
+            for thr, path, label in sources:
+                thr.wait(25000)
+                if thr.isRunning():
+                    notes.append(f"{label} demorou para finalizar e ficou de fora do MP4.")
+                    continue
+                try:
+                    has_audio = path.exists() and path.stat().st_size > 1024
+                except OSError:
+                    has_audio = False
+                if not has_audio:
+                    notes.append(f"{label} não ficou pronto e ficou de fora do MP4.")
+                    continue
+                delay = 0.0
+                if thr.audio_started_at is not None:
+                    # ~0,6 s: tempo que o screenrecord leva até o primeiro quadro.
+                    delay = thr.audio_started_at - started - 0.6  # negativo: áudio começou antes
+                tracks.append((path, delay))
+            if not tracks:
+                return "noaudio", str(video), notes
             ffmpeg = _resolve_ffmpeg()
             if not ffmpeg:
                 raise RuntimeError("FFmpeg não encontrado para incluir o áudio no MP4.")
             tmp = video.with_name(video.stem + ".mux.mp4")
             try:
-                ok, err = mux_audio_into_mp4(ffmpeg, video, audio_path, tmp, delay)
+                ok, err = mux_audios_into_mp4(ffmpeg, video, tracks, tmp)
                 if not ok:
                     raise RuntimeError(err or "Falha ao mesclar o áudio no vídeo.")
                 tmp.replace(video)
@@ -2942,49 +3095,64 @@ class MainWindow(QMainWindow):
                     tmp.unlink(missing_ok=True)
                 except Exception:
                     pass
-            try:
-                audio_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            return "muxed", str(video)
+            for p in paths:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return "muxed", str(video), notes
 
-        def ok(result: tuple[str, str]) -> None:
-            status, info = result
+        def ok(result: tuple[str, str, list[str]]) -> None:
+            status, info, notes = result
+            for n in notes:
+                self._append(self.txt_gravar_out, n)
             if status == "muxed":
                 self._finish_recording_ok(info, with_audio=True)
                 return
-            try:
-                audio_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            self._append(self.txt_gravar_out, info)
+            for _t, p, _l in sources:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
             self._finish_recording_ok(video_path, with_audio=False)
 
         def err(msg: str) -> None:
             self._set_recording_state("idle")
             self._stop_recording_ui()
             self._append(self.txt_gravar_out, f"Vídeo salvo: {video_path}")
-            self._append(self.txt_gravar_out, f"Áudio separado (mescla falhou): {audio_path}")
+            for _t, p, _l in sources:
+                self._append(self.txt_gravar_out, f"Áudio separado (mescla falhou): {p}")
             self._append(self.txt_gravar_out, msg)
 
         self.bg.run(fn, ok, err)
+
+    def _take_audio_sources(self) -> list:
+        """Retira (zera) as capturas de áudio ativas e devolve [(thread, wav, rótulo)]."""
+        out = []
+        if self.audio_thread is not None and self._audio_out_path is not None:
+            out.append((self.audio_thread, self._audio_out_path, "O áudio do Mini PC"))
+        if self.mic_thread is not None and self._mic_out_path is not None:
+            out.append((self.mic_thread, self._mic_out_path, "O microfone do computador"))
+        self.audio_thread = None
+        self.mic_thread = None
+        self._audio_out_path = None
+        self._mic_out_path = None
+        return out
 
     @Slot()
     def _on_recording_finished(self, path: str) -> None:
         thread = self.record_thread
         self.record_thread = None
         self._retire_thread(thread)
-        audio_thr = self.audio_thread
-        self.audio_thread = None
-        audio_path = self._audio_out_path
-        self._audio_out_path = None
-        if audio_thr is None or audio_path is None:
+        sources = self._take_audio_sources()
+        if not sources:
             self._finish_recording_ok(path, with_audio=False)
             return
-        audio_thr.stop()
-        self._retire_thread(audio_thr)
+        for thr, _p, _l in sources:
+            thr.stop()
+            self._retire_thread(thr)
         self._set_recording_state("stopping")
-        self._mux_recorded_audio(path, audio_path, audio_thr)
+        self._mux_recorded_audio(path, sources)
 
     @Slot()
     def _on_recording_failed(self, msg: str) -> None:
@@ -2993,19 +3161,15 @@ class MainWindow(QMainWindow):
         self._retire_thread(thread)
         self._set_recording_state("idle")
         self._stop_recording_ui()
-        audio_thr = self.audio_thread
-        self.audio_thread = None
-        audio_path = self._audio_out_path
-        self._audio_out_path = None
-        if audio_thr is not None:
+        for audio_thr, audio_path, _label in self._take_audio_sources():
             audio_thr.stop()
             self._retire_thread(audio_thr)
-            if audio_path is not None:
-                def cleanup() -> None:
-                    audio_thr.wait(20000)
-                    audio_path.unlink(missing_ok=True)
 
-                self.bg.run(cleanup, lambda _r: None, lambda _m: None)
+            def cleanup(t=audio_thr, p=audio_path) -> None:
+                t.wait(20000)
+                p.unlink(missing_ok=True)
+
+            self.bg.run(cleanup, lambda _r: None, lambda _m: None)
         self._err_dialog(msg)
 
     @Slot()
@@ -3194,6 +3358,8 @@ class MainWindow(QMainWindow):
             e.post_install == "tts_pt_br_voice_v" for e in entries
         )
         self._install_tts_apk_ok = False
+        self._install_reboot_serial = serial if self.chk_reboot_after.isChecked() else None
+        self._install_reboot_pkgs = []
         self._install_post_pending = bool(
             self._install_need_tts_config or self._install_configure_boot
         )
@@ -3283,6 +3449,7 @@ class MainWindow(QMainWindow):
             tts_apk_ok = self._install_tts_apk_ok
             need_boot = self._install_configure_boot
             pkgs = list(dict.fromkeys(self._install_boot_packages)) if need_boot else []
+            self._install_reboot_pkgs = list(pkgs)
             self._install_need_tts_config = False
             self._install_configure_boot = False
 
@@ -3446,6 +3613,15 @@ class MainWindow(QMainWindow):
         )
 
     def _finish_install_queue(self, *, complete: bool = True) -> None:
+        reboot_serial = self._install_reboot_serial
+        reboot_pkgs = list(self._install_reboot_pkgs)
+        self._install_reboot_serial = None
+        self._install_reboot_pkgs = []
+        if reboot_serial and not complete:
+            self._append(
+                self.txt_apps_out,
+                "O equipamento NÃO foi reiniciado: a instalação ficou incompleta. Resolva a pendência e reinstale.",
+            )
         self._install_busy = False
         self._install_configure_boot = False
         self._install_need_tts_config = False
@@ -3464,6 +3640,38 @@ class MainWindow(QMainWindow):
                 "a Voz V ou o AutoStart não forem confirmados.",
             )
         self.refresh_apk_availability()
+        if complete and reboot_serial and reboot_pkgs and self.adb is not None:
+            self._start_reboot_validation(reboot_serial, reboot_pkgs)
+
+    def _start_reboot_validation(self, serial: str, pkgs: list[str]) -> None:
+        """Reinicia o aparelho e confere o Autostart em segundo plano (bloqueia outras ações)."""
+        adb = self.adb
+        if adb is None:
+            return
+        address = self.wifi_connected_address if ":" in serial else None
+        self._reboot_busy = True
+        self.btn_install.setEnabled(False)
+        self._append(self.txt_apps_out, "Último passo: reiniciar o equipamento e validar o Autostart.")
+        report = self._reboot_status.emit
+
+        def fn():
+            return wait_and_validate(
+                adb, serial, address, pkgs, report, should_stop=lambda: self._closing
+            )
+
+        def done(result) -> None:
+            self._reboot_busy = False
+            self.btn_install.setEnabled(True)
+            prefix = "✔ " if result.ok else "⚠ "
+            self._append(self.txt_apps_out, prefix + result.message)
+            self.refresh_apk_availability()
+
+        def fail(msg: str) -> None:
+            self._reboot_busy = False
+            self.btn_install.setEnabled(True)
+            self._append(self.txt_apps_out, f"⚠ Falha ao reiniciar/validar: {msg}")
+
+        self.bg.run(fn, done, fail)
 
     @Slot()
     def install_apk(self) -> None:
@@ -3508,6 +3716,8 @@ class MainWindow(QMainWindow):
             ops.append("gravação de tela")
         if self._install_busy:
             ops.append("instalação de APKs")
+        if self._reboot_busy:
+            ops.append("reinício do equipamento")
         if self._uninstall_busy:
             ops.append("desinstalação")
         if self._optimize_busy:
@@ -3529,7 +3739,7 @@ class MainWindow(QMainWindow):
             self.stop_logcat()
         except Exception:
             pass
-        threads = [t for t in (self.record_thread, self.audio_thread) if t is not None]
+        threads = [t for t in (self.record_thread, self.audio_thread, self.mic_thread) if t is not None]
         for t in threads:
             try:
                 t.stop()
@@ -3544,6 +3754,7 @@ class MainWindow(QMainWindow):
                 pass
         self.record_thread = None
         self.audio_thread = None
+        self.mic_thread = None
         self._retired_threads.clear()
         try:
             self.bg.wait_idle(3000)
@@ -3556,6 +3767,8 @@ class MainWindow(QMainWindow):
             return "uma gravação de tela"
         if self._install_busy:
             return "uma instalação de APK"
+        if self._reboot_busy:
+            return "o reinício do equipamento"
         if self._uninstall_busy:
             return "uma desinstalação"
         if self._optimize_busy:

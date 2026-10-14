@@ -860,6 +860,13 @@ class Adb:
         """Garante que Autostart não está na frente (entre passos da TTS)."""
         self.force_stop_autostart_apps(serial)
 
+    def reboot(self, serial: str) -> None:
+        """Reinicia o aparelho. A conexão cai durante o comando, então erro do adb é tolerado."""
+        try:
+            self._run(["reboot"], serial=serial, timeout_s=20, check=False, retry_server=False)
+        except AdbError:
+            pass
+
     def shell_try(self, serial: str, cmd: str, timeout_s: int = 4) -> str | None:
         """Como shell_lax, mas em timeout/erro devolve None (não derruba o fluxo)."""
         try:

@@ -656,6 +656,83 @@ def mux_audio_into_mp4(
     return False, err or "Falha ao mesclar áudio no vídeo."
 
 
+def _audio_input_args(path: Path, delay_s: float) -> list[str]:
+    """-i do áudio com o ajuste de início: >0 atrasa a faixa, <0 corta o começo dela."""
+    delay = max(-30.0, min(float(delay_s or 0.0), 10.0))
+    if delay > 0.05:
+        return ["-itsoffset", f"{delay:.3f}", "-i", str(path)]
+    if delay < -0.05:
+        return ["-ss", f"{-delay:.3f}", "-i", str(path)]
+    return ["-i", str(path)]
+
+
+def mux_audios_into_mp4(
+    ffmpeg: str, video: Path, tracks: list[tuple[Path, float]], dst: Path
+) -> tuple[bool, str]:
+    """Mescla 1..N áudios (cada um com seu atraso) numa única faixa AAC do MP4.
+
+    Com 2+ fontes (ex.: som do Mini PC + microfone do computador) elas são MISTURADAS (amix) numa
+    só faixa, que toca em qualquer player.
+    """
+    usable = [(p, d) for p, d in tracks if p.exists() and p.stat().st_size >= 1024]
+    if not video.exists() or video.stat().st_size < 1024:
+        return False, "Vídeo inválido para mesclar áudio."
+    if not usable:
+        return False, "Nenhum arquivo de áudio válido para mesclar."
+    if len(usable) == 1:
+        return mux_audio_into_mp4(ffmpeg, video, usable[0][0], dst, usable[0][1])
+
+    n = len(usable)
+    inputs: list[str] = []
+    for path, delay in usable:
+        inputs += _audio_input_args(path, delay)
+    chains = [
+        f"[{i + 1}:a]aresample=async=1:first_pts=0,aformat=sample_rates=44100:channel_layouts=stereo[a{i}]"
+        for i in range(n)
+    ]
+    labels = "".join(f"[a{i}]" for i in range(n))
+    tail = [
+        "-c:a",
+        "aac",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-b:a",
+        "160k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        "-f",
+        "mp4",
+        str(dst),
+    ]
+
+    def cmd(mix: str) -> list[str]:
+        return (
+            [ffmpeg, "-y", "-loglevel", "error", "-i", str(video), *inputs]
+            + ["-filter_complex", ";".join(chains + [mix]), "-map", "0:v:0", "-map", "[a]", "-c:v", "copy"]
+            + tail
+        )
+
+    attempts = [
+        # soma sem reduzir o volume de cada fonte + limitador contra estouro
+        cmd(f"{labels}amix=inputs={n}:duration=longest:normalize=0,alimiter=limit=0.95,apad[a]"),
+        # builds de ffmpeg sem a opção normalize/alimiter
+        cmd(f"{labels}amix=inputs={n}:duration=longest,apad[a]"),
+    ]
+    ok, err = _try_ffmpeg_cmds(attempts, dst)
+    if ok and _has_audio_stream(dst):
+        return True, ""
+    if ok:
+        try:
+            dst.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return False, "O MP4 mesclado ficou sem faixa de áudio."
+    return False, err or "Falha ao mesclar os áudios no vídeo."
+
+
 class ScreenRecordThread(QThread):
     status = Signal(str)
     finished = Signal(str)
