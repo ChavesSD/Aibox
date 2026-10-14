@@ -93,3 +93,5 @@ Só validações aditivas: o caminho que já funcionava nos Mini PCs continua de
 - Com isso o reset foi confirmado pela UI do app e o aparelho caiu da rede. O app terminou (49 s) ANTES de o aparelho cair e mostrou "tentativa de confirmação enviada, conexão ADB mantida" — mensagem tecnicamente correta no momento, mas o reset estava em andamento (pode valer esperar mais que 20 s antes de concluir).
 - Depois do reset o Android perde o Wi-Fi e o ADB: precisa de acesso físico para reconfigurar.
 - Testes: `test_safety_lote_a.py` (240 no total).
+
+- **Mensagem pós-reset (14/10/2026):** o monitor Wi-Fi (`_wifi_monitor_tick`) tentava reconectar o aparelho que reiniciava e, após 3 falhas, mostrava o erro técnico cru ("cannot connect to … (10060)"). Agora, durante/logo após um reset pedido (`_reset_requested_at`, janela de 15 min) o monitor NÃO reconecta e mostra uma única mensagem amigável (`_notify_reset_in_progress`: o aparelho desconectou, é esperado, ele perde Wi‑Fi/depuração, reconecte depois de configurar). A queda de conexão comum também ficou amigável, com o erro técnico por último. Testes: `test_reset_message.py` (245 no total).

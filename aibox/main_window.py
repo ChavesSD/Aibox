@@ -325,6 +325,8 @@ class MainWindow(QMainWindow):
         self._preview_token: int = 0
         self._quick_busy: set[str] = set()
         self._factory_reset_busy: bool = False
+        self._reset_requested_at: float | None = None  # quando o reset foi pedido (janela de tolerância)
+        self._reset_notified: bool = False
         self._closing: bool = False
         self._adb_initing: bool = False
         self._video_pending: bool = False
@@ -2441,6 +2443,9 @@ class MainWindow(QMainWindow):
                     break
             if state == "device":
                 return {"present": True, "state": state}
+            if self._reset_recent():
+                # Reset em andamento: o aparelho vai sumir; não adianta (nem deve) tentar reconectar.
+                return {"present": False, "state": state, "skip_reconnect": True}
             try:
                 msg = self.adb.connect(address)
                 return {"present": False, "state": state, "reconnect_msg": msg}
@@ -2456,6 +2461,11 @@ class MainWindow(QMainWindow):
                 if self.wifi_reconnect_failures:
                     self._wifi_log("Conexão Wi‑Fi estabilizou novamente.")
                 self.wifi_reconnect_failures = 0
+                return
+
+            if res.get("skip_reconnect"):
+                self._wifi_log("Monitor: o aparelho saiu da rede após a restauração de fábrica (esperado).")
+                self._notify_reset_in_progress(address)
                 return
 
             state = res.get("state")
@@ -2478,10 +2488,12 @@ class MainWindow(QMainWindow):
                 hint = self._wifi_connect_hint(err_txt, address)
                 self.wifi_connected_address = None
                 self._set_wifi_state("disconnected")
-                if hint:
-                    self._err_dialog((err_txt + "\n\n" + hint).strip())
-                else:
-                    self._err_dialog(err_txt)
+                self._err_dialog(
+                    f"O Aibox perdeu a conexão com {address} e não conseguiu reconectar após 3 tentativas.\n\n"
+                    "Verifique se o aparelho está ligado, na mesma rede e com a depuração ativa."
+                    + (f"\n\nDica: {hint}" if hint else "")
+                    + f"\n\nDetalhe técnico: {err_txt}"
+                )
 
         def err(msg: str) -> None:
             if self.wifi_attempt_id != attempt_id:
@@ -3594,6 +3606,8 @@ class MainWindow(QMainWindow):
 
         self.btn_factory_reset.setEnabled(False)
         self._factory_reset_busy = True
+        self._reset_requested_at = time.monotonic()
+        self._reset_notified = False
         self._append(self.txt_reset_out, f"Iniciando restauração de fábrica em {serial}…")
         self._append(
             self.txt_reset_out,
@@ -3609,29 +3623,47 @@ class MainWindow(QMainWindow):
             msg, should_disconnect = result
             self._append(self.txt_reset_out, msg)
             if should_disconnect:
-                self._after_factory_reset(serial)
-                QMessageBox.warning(
-                    self,
-                    APP_NAME,
-                    "A conexão com o Mini PC foi perdida porque a restauração de fábrica foi iniciada.\n\n"
-                    "Isso é esperado: o aparelho apaga os dados e reinicia. "
-                    "Quando ele voltar, reconecte em Conectar e atualize a lista.",
-                )
+                self._notify_reset_in_progress(serial)
             else:
                 self._append(
                     self.txt_reset_out,
-                    "Confirme a restauração na tela do dispositivo. A conexão ADB foi mantida.",
+                    "A confirmação foi enviada. Se o aparelho começar a reiniciar (a tela apaga e a "
+                    "conexão cai), é a restauração em andamento — o Aibox avisa quando ele desconectar. "
+                    "Se nada acontecer, confirme «Redefinir» na tela do aparelho.",
                 )
             self.btn_factory_reset.setEnabled(True)
 
         def err_cb(msg: str) -> None:
             self._factory_reset_busy = False
+            self._reset_requested_at = None
             self.btn_factory_reset.setEnabled(True)
             # factory_reset() já confirma a queda real do aparelho; erro aqui = falha de verdade.
             self._append(self.txt_reset_out, f"Falha: {msg}")
             self._err_dialog(msg)
 
         self.bg.run(fn, ok_cb, err_cb)
+
+    _RESET_GRACE_S = 900.0
+    _RESET_FRIENDLY_TEXT = (
+        "A restauração de fábrica foi iniciada e o aparelho desconectou.\n\n"
+        "Isso é esperado: ele está apagando os dados e reiniciando, e também perde a configuração "
+        "de Wi‑Fi e a Depuração USB/sem fio.\n\n"
+        "Quando terminar, configure o Wi‑Fi e ative a depuração no aparelho e depois reconecte em «Conectar»."
+    )
+
+    def _reset_recent(self) -> bool:
+        """True durante/logo depois de um reset pedido: a queda de conexão é esperada, não um erro."""
+        at = self._reset_requested_at
+        return at is not None and (time.monotonic() - at) < self._RESET_GRACE_S
+
+    def _notify_reset_in_progress(self, serial: str) -> None:
+        """Mensagem amigável (uma vez) quando o aparelho some depois de um reset."""
+        if self._reset_notified:
+            return
+        self._reset_notified = True
+        self._reset_requested_at = None
+        self._after_factory_reset(serial)
+        QMessageBox.information(self, APP_NAME, self._RESET_FRIENDLY_TEXT)
 
     def _after_factory_reset(self, serial: str) -> None:
         """Desconecta o dispositivo do Aibox após o reset."""
