@@ -488,6 +488,70 @@ def _remux_compatible_mp4(ffmpeg: str, src: Path, dst: Path) -> tuple[bool, str]
     return False, err or "Falha ao gerar MP4 compatível."
 
 
+def _is_single_frame_recording(path: Path) -> bool:
+    """MP4 íntegro (ftyp+moov, 1 faixa de vídeo) mas sem duração: tela estática.
+
+    O screenrecord do Android só emite quadros quando a imagem muda; numa tela parada sai 1 quadro
+    e a duração fica N/A.
+    """
+    try:
+        data = path.read_bytes() if path.stat().st_size <= 64 * 1024 * 1024 else b""
+    except OSError:
+        return False
+    if b"ftyp" not in data[:65536] or b"moov" not in data:
+        return False
+    dur, _audio = _ffmpeg_info(path)
+    return dur is None or dur <= 0.2
+
+
+def _extend_static_recording(ffmpeg: str, src: Path, dst: Path, seconds: float) -> tuple[bool, str]:
+    """Estende o único quadro até `seconds`: extrai o quadro e o repete num MP4 com a duração real."""
+    seconds = max(1.0, min(float(seconds), 180.0))
+    frame = dst.with_suffix(".frame.png")
+    try:
+        cp = run_hidden(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", str(src), "-frames:v", "1", "-update", "1", str(frame)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if cp.returncode != 0 or not frame.exists() or frame.stat().st_size < 100:
+            return False, (cp.stderr or cp.stdout or "Não foi possível extrair o quadro.").strip()
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-loop",
+            "1",
+            "-framerate",
+            "25",
+            "-i",
+            str(frame),
+            "-t",
+            f"{seconds:.2f}",
+            "-vf",
+            "format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-movflags",
+            "+faststart",
+            "-f",
+            "mp4",
+            str(dst),
+        ]
+        return _try_ffmpeg_cmds([cmd], dst)
+    finally:
+        try:
+            frame.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def mux_audio_into_mp4(
     ffmpeg: str, video: Path, audio: Path, dst: Path, audio_delay_s: float = 0.0
 ) -> tuple[bool, str]:
@@ -758,6 +822,25 @@ class ScreenRecordThread(QThread):
                 self.failed.emit((err or "Falha ao baixar o vídeo do dispositivo.").strip())
                 return
 
+            if not _mp4_is_playable(pull_tmp):
+                # Tela estática: 1 quadro sem duração. Em vez de falhar, estende o quadro até o tempo gravado.
+                ffmpeg_fix = _resolve_ffmpeg()
+                if ffmpeg_fix and _is_single_frame_recording(pull_tmp):
+                    fixed = self.out_path.with_name(self.out_path.stem + ".static.mp4")
+                    ok_fix, _err_fix = _extend_static_recording(
+                        ffmpeg_fix, pull_tmp, fixed, min(elapsed, float(self.time_limit_s))
+                    )
+                    if ok_fix:
+                        fixed.replace(pull_tmp)
+                        self.status.emit(
+                            "A tela ficou parada: o Android só grava quando a imagem muda. "
+                            "O vídeo foi estendido até o tempo gravado."
+                        )
+                    else:
+                        try:
+                            fixed.unlink(missing_ok=True)
+                        except OSError:
+                            pass
             if not _mp4_is_playable(pull_tmp):
                 try:
                     pull_tmp.unlink(missing_ok=True)

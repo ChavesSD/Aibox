@@ -2143,6 +2143,31 @@ class Adb:
         return None
 
     @staticmethod
+    def xml_tts_uninstall_dialog(xml: str) -> bool:
+        """True se a tela é o diálogo «Desinstalar esta voz?» (MANTER / DESINSTALAR)."""
+        low = Adb._fold_ui_text(xml or "")
+        return "desinstalar esta voz" in low or "uninstall this voice" in low
+
+    def _tts_dismiss_uninstall_dialog(
+        self, serial: str, xml: str, status: Callable[[str], None]
+    ) -> tuple[str, bool]:
+        """Cancela o diálogo de desinstalação com BACK (nunca confirma). Devolve (xml, havia_diálogo).
+
+        Aparece quando a voz JÁ está instalada: depois de abrir o idioma o foco cai na lixeira
+        (se não estivesse instalada seria o botão de baixar) e o 2º toque do «Enter duplo» a aciona.
+        """
+        dismissed = False
+        for _ in range(3):
+            if not self.xml_tts_uninstall_dialog(xml):
+                break
+            dismissed = True
+            status("TTS: a voz já está instalada («Desinstalar esta voz?») — mantendo, sem desinstalar.")
+            self.shell_try(serial, "input keyevent 4", timeout_s=3)  # BACK = cancelar
+            time.sleep(0.9)
+            xml = self._dump_ui_xml(serial) or xml
+        return xml, dismissed
+
+    @staticmethod
     def _locale_title_is_pt_br(title: str | None) -> bool:
         low = Adb._fold_ui_text(title or "")
         return "portugu" in low and ("brasil" in low or "brazil" in low)
@@ -2222,12 +2247,15 @@ class Adb:
         screen = self._tts_classify_screen(xml)
         for _ in range(3):
             # Splash/carregando: reclassifica antes de decidir (pular a tela de país escolheria o país errado).
-            if screen not in ("unknown", ""):
-                break
+            if screen not in ("unknown", "") or self.xml_tts_uninstall_dialog(xml):
+                break  # tela reconhecida (ou o diálogo de desinstalação, tratado logo abaixo)
             time.sleep(1.5)
             xml = self._dump_ui_xml(serial) or xml
             screen = self._tts_classify_screen(xml)
         trail.append(f"apos-enter={screen}")
+        xml, already_installed = self._tts_dismiss_uninstall_dialog(serial, xml, status)
+        if already_installed:
+            trail.append("voz-ja-instalada")
         xml, lang_ok = self._tts_ensure_portuguese_brazil(serial, xml, status, trail)
         if not lang_ok:
             return False, trail
@@ -2243,18 +2271,22 @@ class Adb:
                 self._tts_press_enter(serial)
                 trail.append("enter-brasil")
 
-        status(
-            f"TTS: aguardando download de português (Brasil) "
-            f"({self.TTS_PT_BR_DOWNLOAD_WAIT_S}s)…"
-        )
-        time.sleep(self.TTS_PT_BR_DOWNLOAD_WAIT_S)
-        trail.append(f"wait-{self.TTS_PT_BR_DOWNLOAD_WAIT_S}s")
+        if already_installed:
+            trail.append("sem-espera-download")  # a voz já estava instalada: nada para baixar
+        else:
+            status(
+                f"TTS: aguardando download de português (Brasil) "
+                f"({self.TTS_PT_BR_DOWNLOAD_WAIT_S}s)…"
+            )
+            time.sleep(self.TTS_PT_BR_DOWNLOAD_WAIT_S)
+            trail.append(f"wait-{self.TTS_PT_BR_DOWNLOAD_WAIT_S}s")
 
         status("TTS: conferindo se o download da voz terminou…")
         poll_deadline = time.monotonic() + max(0.0, float(self.TTS_PT_BR_DOWNLOAD_POLL_S))
         xml = ""
         while True:
             xml = self._dump_ui_xml(serial) or ""
+            xml, _gone = self._tts_dismiss_uninstall_dialog(serial, xml, status)
             if self.xml_voice_v_selected(xml) or self._tts_find_voice_v_center(xml):
                 trail.append("voz-v-na-tela")
                 break
@@ -2281,6 +2313,10 @@ class Adb:
                 status("TTS: Voz V marcada.")
                 return True, trail + ["voz-v-ok"]
 
+        guard_xml = self._dump_ui_xml(serial) or ""
+        if self.xml_tts_uninstall_dialog(guard_xml):
+            self._tts_dismiss_uninstall_dialog(serial, guard_xml, status)
+            trail.append("dialogo-cancelado")
         status("TTS: 5× baixo até Voz V…")
         self._tts_dpad_down(serial, self.TTS_VOICE_V_DOWN_COUNT)
         trail.append("5-down")

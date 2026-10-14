@@ -151,6 +151,103 @@ class TestNavigationIntegration(unittest.TestCase):
         self.assertTrue(any(t.startswith("idioma-errado=") for t in trail))
 
 
+DIALOGO = (
+    '<hierarchy><node text="Desinstalar esta voz?"/><node text="MANTER" clickable="true"/>'
+    '<node text="DESINSTALAR" clickable="true"/></hierarchy>'
+)
+
+
+class TestUninstallDialog(unittest.TestCase):
+    def test_detection(self) -> None:
+        self.assertTrue(Adb.xml_tts_uninstall_dialog(DIALOGO))
+        self.assertTrue(Adb.xml_tts_uninstall_dialog('<node text="Uninstall this voice?"/>'))
+        self.assertFalse(Adb.xml_tts_uninstall_dialog(PORTUGUES))
+        self.assertFalse(Adb.xml_tts_uninstall_dialog(""))
+
+    def test_dismiss_only_presses_back_never_confirms(self) -> None:
+        a = _adb()
+        keys: list[str] = []
+        seq = iter([PORTUGUES])
+        a.shell_try = lambda s, cmd, timeout_s=0: keys.append(cmd) or ""  # type: ignore[method-assign]
+        a._dump_ui_xml = lambda s: next(seq, PORTUGUES)  # type: ignore[method-assign]
+        msgs: list[str] = []
+        with mock.patch("aibox.adb.time.sleep"):
+            xml, was = a._tts_dismiss_uninstall_dialog("S1", DIALOGO, msgs.append)
+        self.assertTrue(was)
+        self.assertEqual(keys, ["input keyevent 4"])  # só BACK: nada de ENTER/CENTER/baixo
+        self.assertEqual(Adb.xml_voice_language_title(xml), "português (Brasil)")
+        self.assertTrue(any("sem desinstalar" in m for m in msgs))
+
+    def test_no_dialog_no_keys(self) -> None:
+        a = _adb()
+        keys: list[str] = []
+        a.shell_try = lambda s, cmd, timeout_s=0: keys.append(cmd) or ""  # type: ignore[method-assign]
+        xml, was = a._tts_dismiss_uninstall_dialog("S1", PORTUGUES, lambda m: None)
+        self.assertFalse(was)
+        self.assertEqual(keys, [])
+
+    def test_gives_up_pressing_back_after_three_tries(self) -> None:
+        a = _adb()
+        keys: list[str] = []
+        a.shell_try = lambda s, cmd, timeout_s=0: keys.append(cmd) or ""  # type: ignore[method-assign]
+        a._dump_ui_xml = lambda s: DIALOGO  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            _x, was = a._tts_dismiss_uninstall_dialog("S1", DIALOGO, lambda m: None)
+        self.assertTrue(was)
+        self.assertEqual(keys.count("input keyevent 4"), 3)
+
+
+class TestNavigationWithInstalledVoice(unittest.TestCase):
+    def _nav(self, dumps: list[str]):
+        a = _adb()
+        a.TTS_PT_BR_DOWNLOAD_WAIT_S = 30
+        a.TTS_PT_BR_DOWNLOAD_POLL_S = 0
+        keys: list[str] = []
+        sleeps: list[float] = []
+        a.shell_try = lambda s, cmd, timeout_s=0: keys.append(cmd) or ""  # type: ignore[method-assign]
+        a._tts_dpad_down = lambda s, n: keys.append(f"DOWN{n}")  # type: ignore[method-assign]
+        a._tts_press_enter = lambda s: keys.append("ENTER")  # type: ignore[method-assign]
+        seq = iter(dumps)
+        last = {"v": ""}
+
+        def dump(_s: str) -> str:
+            try:
+                last["v"] = next(seq)
+            except StopIteration:
+                pass
+            return last["v"]
+
+        a._dump_ui_xml = dump  # type: ignore[method-assign]
+        a._tts_select_voice_v_now = mock.Mock(return_value=True)  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep", side_effect=lambda s: sleeps.append(s)):
+            ok, trail = a._tts_navigate_installer("S1")
+        return ok, trail, keys, sleeps
+
+    def test_installed_voice_dialog_is_cancelled_and_download_wait_skipped(self) -> None:
+        ok, trail, keys, sleeps = self._nav([DIALOGO, PORTUGUES, PORTUGUES, PORTUGUES])
+        self.assertTrue(ok)
+        self.assertIn("voz-ja-instalada", trail)
+        self.assertIn("sem-espera-download", trail)
+        self.assertFalse(any(t.startswith("wait-") for t in trail))
+        self.assertNotIn(30, sleeps)  # não espera 30 s por um download que não existe
+        self.assertEqual(keys.count("input keyevent 4"), 1)  # um único BACK (cancelar)
+
+    def test_not_installed_keeps_the_download_wait(self) -> None:
+        ok, trail, _k, sleeps = self._nav([PORTUGUES, PORTUGUES, PORTUGUES, PORTUGUES])
+        self.assertTrue(ok)
+        self.assertIn("wait-30s", trail)
+        self.assertIn(30, sleeps)
+        self.assertNotIn("voz-ja-instalada", trail)
+
+    def test_dialog_never_followed_by_blind_down_enter(self) -> None:
+        # mesmo que o diálogo reapareça antes do "5x baixo + Enter", ele é cancelado primeiro
+        _ok, _trail, keys, _s = self._nav([PORTUGUES, DIALOGO, PORTUGUES, PORTUGUES, PORTUGUES])
+        i_back = keys.index("input keyevent 4") if "input keyevent 4" in keys else -1
+        self.assertGreaterEqual(i_back, 0)
+        if "DOWN5" in keys:
+            self.assertLess(i_back, keys.index("DOWN5"))
+
+
 class TestOptimizeDiskMessage(unittest.TestCase):
     def _report(self, dexopt_ok: bool) -> str:
         a = _adb()
