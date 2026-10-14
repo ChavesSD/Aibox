@@ -91,6 +91,30 @@ def copy_assets(src_root: Path, dest: Path) -> list[Path]:
     return files
 
 
+def verify_published() -> int:
+    """Confere o apks.json PUBLICADO contra os arquivos reais (detecta APK trocado sem regenerar o catálogo)."""
+    import urllib.request
+
+    from aibox.apk_sync import fetch_apks_manifest
+
+    manifest = fetch_apks_manifest()
+    print(f"Catálogo publicado: versão {manifest.version} ({manifest.updated_at}) — {len(manifest.apks)} APKs")
+    bad = 0
+    for apk in manifest.apks:
+        req = urllib.request.Request(apk.url, headers={"User-Agent": "Aibox-verify", "Cache-Control": "no-cache"})
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = resp.read()
+        digest = hashlib.sha256(data).hexdigest()
+        ok = digest == apk.sha256
+        bad += 0 if ok else 1
+        print(f"  {'OK ' if ok else 'ERRO'} {apk.key}" + ("" if ok else f"  (catálogo {apk.sha256[:10]}… ≠ arquivo {digest[:10]}…)"))
+    if bad:
+        print(f"\n{bad} APK(s) diferem do catálogo. Regenere e publique: python publish_apks.py --version X.Y.Z", file=sys.stderr)
+        return 1
+    print("Tudo confere.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Publica APKs no ReleasesAibox")
     parser.add_argument("--version", default="1.0.0", help="Versão do catálogo de APKs")
@@ -106,7 +130,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Cria/atualiza o GitHub Release com gh",
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Só confere o catálogo publicado contra os arquivos do repositório (não gera nada)",
+    )
     args = parser.parse_args(argv)
+    if args.verify:
+        return verify_published()
 
     src = Path(args.source) if args.source else _apks_source()
     if not src.is_dir():

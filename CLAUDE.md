@@ -95,3 +95,8 @@ Só validações aditivas: o caminho que já funcionava nos Mini PCs continua de
 - Testes: `test_safety_lote_a.py` (240 no total).
 
 - **Mensagem pós-reset (14/10/2026):** o monitor Wi-Fi (`_wifi_monitor_tick`) tentava reconectar o aparelho que reiniciava e, após 3 falhas, mostrava o erro técnico cru ("cannot connect to … (10060)"). Agora, durante/logo após um reset pedido (`_reset_requested_at`, janela de 15 min) o monitor NÃO reconecta e mostra uma única mensagem amigável (`_notify_reset_in_progress`: o aparelho desconectou, é esperado, ele perde Wi‑Fi/depuração, reconecte depois de configurar). A queda de conexão comum também ficou amigável, com o erro técnico por último. Testes: `test_reset_message.py` (245 no total).
+
+## Atualizar APKs no repositório de releases (14/10/2026)
+- Ao trocar um APK em `ChavesSD/ReleasesAibox/apk_assets/` é OBRIGATÓRIO regenerar e publicar o `apks.json` (sha256/size): sem isso o Aibox recusa o download ("Checksum inválido", correto). Em 13/10 isso ocorreu com os dois "Atendimento_Inteligente"; corrigido com o catálogo 1.0.3 (commit `c783a15` do repo de releases).
+- Receita: reconstruir a pasta `Totem|Painel|Outros` a partir dos arquivos do repo, `publish_apks.build_manifest(src, "X.Y.Z")`, commit do `apks.json`. Conferir com **`python publish_apks.py --verify`** (baixa cada APK do catálogo publicado e compara o hash). O cache do raw.githubusercontent pode atrasar o catálogo novo por alguns minutos.
+- O app agora explica a falha ("apks.json desatualizado… regenerar com publish_apks.py") em vez de mostrar Esperado/Obtido (`apk_sync.friendly_sync_error`). Testes: `test_apk_sync_msg.py` (248 no total).

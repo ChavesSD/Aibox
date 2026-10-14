@@ -227,6 +227,18 @@ def plan_apk_sync(manifest: ApksManifest, *, root: Path | None = None) -> list[A
     return items
 
 
+def friendly_sync_error(err: object) -> str:
+    """Texto amigável para falhas de download; checksum divergente = catálogo desatualizado."""
+    text = str(err or "").strip()
+    if "checksum inválido" in text.lower():
+        return (
+            "o arquivo publicado não confere com o catálogo (apks.json desatualizado), então "
+            "não foi baixado por segurança. Avise quem publica os APKs para regenerar o catálogo "
+            "(python publish_apks.py) e publicar de novo."
+        )
+    return text
+
+
 def sync_apks(
     *,
     root: Path | None = None,
@@ -301,7 +313,7 @@ def sync_apks(
                     except OSError:
                         pass
         if last_error is not None:
-            failed.append(f"{label}: {last_error}")
+            failed.append(f"{label}: {friendly_sync_error(last_error)}")
 
     return ApkSyncResult(downloaded=downloaded, skipped=skipped, failed=failed)
 
