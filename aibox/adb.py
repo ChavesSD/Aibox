@@ -4080,6 +4080,15 @@ class Adb:
                 return True
 
             label = self._focused_action_label(serial)
+            if label is None:
+                # Nenhum item focado no dump (o foco inicial só aparece depois de uma seta):
+                # até 2 setas só para focar; o ENTER continua exigindo rótulo de confirmação.
+                for _ in range(2):
+                    self.shell_lax(serial, "input keyevent 20", timeout_s=3)
+                    time.sleep(0.4)
+                    label = self._focused_action_label(serial)
+                    if label is not None:
+                        break
             if not self._is_wipe_confirm_label(label):
                 if not self._is_cancel_label(label):
                     return False  # tela inesperada: não arrisca apertar ENTER

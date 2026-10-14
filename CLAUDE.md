@@ -87,3 +87,9 @@ Só validações aditivas: o caminho que já funcionava nos Mini PCs continua de
 - Gravação de tela estática: `screenrecord` só emite quadros quando a imagem muda → 1 quadro, duração N/A, o app rejeitava como "incompleto". Agora `_is_single_frame_recording` + `_extend_static_recording` (extrai o quadro e repete até o tempo gravado). Testes: `test_static_screen.py` (238 no total).
 - Publicação inconsistente (fora do app): em 13/10 os APKs Totem/Painel "Atendimento_Inteligente" foram trocados no repositório de releases sem regenerar `apks.json` → hash não confere → o app recusa (correto), mas os técnicos não conseguem baixar. Regenerar com `publish_apks.py`.
 - Sobras inevitáveis sem root: props `persist.sys.boot*` ficam com valor vazio após o teste de Autostart.
+
+## Reset de fábrica real (14/10/2026, autorizado pelo usuário no aparelho de teste 192.168.2.91)
+- A tela "Redefinir" (`com.android.tv.settings/.device.storage.ResetActivity`, botões Cancelar/Redefinir) **não mostra nenhum item focado no dump** até uma seta; a trava do Lote A (rótulo desconhecido = não aperta Enter) abortava. Agora, sem foco visível, `_confirm_factory_reset_on_ui` dá até 2 setas só para focar e **continua só apertando Enter em «Redefinir»/«Apagar tudo»** (nunca «Cancelar»/desconhecido).
+- Com isso o reset foi confirmado pela UI do app e o aparelho caiu da rede. O app terminou (49 s) ANTES de o aparelho cair e mostrou "tentativa de confirmação enviada, conexão ADB mantida" — mensagem tecnicamente correta no momento, mas o reset estava em andamento (pode valer esperar mais que 20 s antes de concluir).
+- Depois do reset o Android perde o Wi-Fi e o ADB: precisa de acesso físico para reconfigurar.
+- Testes: `test_safety_lote_a.py` (240 no total).

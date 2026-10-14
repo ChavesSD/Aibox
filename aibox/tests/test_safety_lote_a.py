@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from unittest import mock
 
 from aibox.adb import (
     Adb,
@@ -132,6 +133,30 @@ class TestFactoryResetSafety(unittest.TestCase):
         a.shell_lax = lambda _s, cmd, timeout_s=0: sent.append(cmd) or ""  # type: ignore[method-assign]
         self.assertFalse(a._confirm_factory_reset_on_ui("S1"))
         self.assertNotIn("input keyevent 23", sent)
+
+
+    def test_confirm_without_visible_focus_gives_focus_then_confirms(self) -> None:
+        # Mini PC real: o dump não mostra foco até uma seta; 1ª seta -> «Cancelar», 2ª -> «Redefinir».
+        a = _fake_adb()
+        sent: list[str] = []
+        labels = iter([None, "Cancelar", "Redefinir"])
+        a._wait_device_offline = lambda *_a, **_k: "input keyevent 23" in sent  # type: ignore[method-assign]
+        a._focused_action_label = lambda _s: next(labels)  # type: ignore[method-assign]
+        a.shell_lax = lambda _s, cmd, timeout_s=0: sent.append(cmd) or ""  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            self.assertTrue(a._confirm_factory_reset_on_ui("S1"))
+        self.assertEqual(sent, ["input keyevent 20", "input keyevent 20", "input keyevent 23"])
+
+    def test_confirm_without_any_focus_never_presses_enter(self) -> None:
+        a = _fake_adb()
+        sent: list[str] = []
+        a._wait_device_offline = lambda *_a, **_k: False  # type: ignore[method-assign]
+        a._focused_action_label = lambda _s: None  # type: ignore[method-assign]
+        a.shell_lax = lambda _s, cmd, timeout_s=0: sent.append(cmd) or ""  # type: ignore[method-assign]
+        with mock.patch("aibox.adb.time.sleep"):
+            self.assertFalse(a._confirm_factory_reset_on_ui("S1"))
+        self.assertNotIn("input keyevent 23", sent)
+        self.assertLessEqual(sent.count("input keyevent 20"), 2)
 
 
 if __name__ == "__main__":
