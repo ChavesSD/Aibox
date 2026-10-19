@@ -1,0 +1,13 @@
+{
+  "version": "1.0.12",
+  "min_version": "1.0.0",
+  "channel": "stable",
+  "published_at": "2026-10-19",
+  "notes": {
+    "added": [
+      "Quando a verificação, o download ou o início da atualização falham, o erro é gravado em update.log e a mensagem mostra onde ele está, facilitando o suporte"
+    ],
+    "fixed": [],
+    "removed": []
+  }
+}
