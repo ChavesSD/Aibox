@@ -1844,9 +1844,17 @@ class MainWindow(QMainWindow):
             self._update_busy = False
             self.btn_check_updates.setEnabled(True)
             self.lbl_update_status.setText("Não foi possível verificar atualizações.")
-            self._err_dialog(msg)
+            self._update_error(f"verificar: {msg}", msg)
 
         self.bg.run(fn, ok, err)
+
+    def _update_error(self, detail: str, shown: str) -> None:
+        """Mostra o erro da atualização e grava o detalhe em updates/update.log."""
+        from .updater import log_update_event
+
+        path = log_update_event(detail)
+        extra = f"\n\nDetalhes gravados em:\n{path}" if path else ""
+        self._err_dialog(shown + extra)
 
     def _start_update_download(self, result: UpdateCheckResult) -> None:
         install_dir = install_dir_for_update()
@@ -1912,7 +1920,7 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._update_busy = False
                 self.btn_check_updates.setEnabled(True)
-                self._err_dialog(f"Falha ao iniciar o instalador: {e}")
+                self._update_error(f"iniciar helper: {e!r}", f"Falha ao iniciar o instalador: {e}")
                 return
             QMessageBox.information(
                 self,
@@ -1935,7 +1943,7 @@ class MainWindow(QMainWindow):
             self.progress_update.setVisible(False)
             self.lbl_update_pct.setVisible(False)
             self.lbl_update_status.setText("Falha no download da atualização.")
-            self._err_dialog(msg)
+            self._update_error(f"download: {msg}", msg)
 
         self.bg.run(fn, ok, err)
 

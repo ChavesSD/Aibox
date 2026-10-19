@@ -115,6 +115,18 @@ def manifest_url() -> str:
     return (os.environ.get("AIBOX_UPDATE_MANIFEST_URL") or DEFAULT_UPDATE_MANIFEST_URL).strip()
 
 
+def log_update_event(message: str) -> Path | None:
+    """Registra o erro/etapa da atualização em updates/update.log (para diagnóstico em outro PC)."""
+    try:
+        d = updates_dir()
+        path = d / "update.log"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} v{APP_VERSION} {message}\n")
+        return path
+    except Exception:
+        return None
+
+
 def updates_dir() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
     d = base / APP_DIR_NAME / "updates"
